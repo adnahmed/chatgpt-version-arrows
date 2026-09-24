@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Edit Pagination Patch",
-  "version": "0.5.3",
+  "version": "0.8.0",
+  "version_name": "0.8.0-batch-test.1",
   "description": "Restores ChatGPT edited-message version controls.",
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["patch.js"],
+      "js": ["patch.js", "batch-pagination.js"],
+      "css": ["batch-pagination.css"],
       "run_at": "document_start",
       "world": "MAIN"
     }
