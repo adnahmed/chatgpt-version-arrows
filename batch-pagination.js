@@ -1,11 +1,12 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.8.0-batch-test.7";
+  const VERSION = "0.8.0-batch-test.12";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
   const CONTROLS = "[data-batch-edit-pagination]";
+  const ASSISTANT_CONTROLS = "[data-batch-assistant-pagination]";
   const BATCH_PATH = "/backend-api/conversations/batch";
   const RUNTIME_HINT = /^\/cdn\/assets\/633146\.[a-z0-9]+\.js$/;
   const MAX_GRAPHS = 3;
@@ -490,6 +491,20 @@
       failed: "Could not switch the message version.",
     };
 
+  const assistantLabels = () => document.documentElement.lang.toLowerCase().startsWith("ru")
+    ? {
+      previous: "Предыдущий ответ",
+      next: "Следующий ответ",
+      group: "Версии ответа",
+      failed: "Не удалось переключить версию ответа.",
+    }
+    : {
+      previous: "Previous response",
+      next: "Next response",
+      group: "Response versions",
+      failed: "Could not switch the response version.",
+    };
+
   const createButton = (label, direction, action) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -511,15 +526,7 @@
     return button;
   };
 
-  const switchVersion = async (bubble, direction) => {
-    const context = readContext(bubble);
-    if (!context || pendingConversations.has(context.conversationId)) return;
-    const graph = graphFor(context);
-    if (!graph || !hydrateGraph(context, graph)) return;
-    const ids = variants(graph, context.messageId);
-    const index = ids.indexOf(context.messageId);
-    const target = index < 0 ? null : ids[index + direction];
-    if (!target) return;
+  const requestSwitch = async (context, currentMessageId, targetMessageId, failureMessage) => {
     if (!switcher) {
       await discoverRuntime();
       scanSwitcher();
@@ -532,22 +539,33 @@
     conversationErrors.delete(context.conversationId);
     record("switch-requested", {
       conversationId: context.conversationId,
-      currentMessageId: context.messageId,
-      targetMessageId: target,
+      currentMessageId,
+      targetMessageId,
     });
     schedule();
     try {
-      await switcher(context.scope, context.conversationId, target);
-      record("switch-completed", { conversationId: context.conversationId, targetMessageId: target });
+      await switcher(context.scope, context.conversationId, targetMessageId);
+      record("switch-completed", { conversationId: context.conversationId, targetMessageId });
     } catch (error) {
-      const message = labels().failed;
-      conversationErrors.set(context.conversationId, message);
-      record("switch-failed", { conversationId: context.conversationId, targetMessageId: target, error: String(error) });
-      warnOnce("switch-failed", message, { error: String(error) });
+      conversationErrors.set(context.conversationId, failureMessage);
+      record("switch-failed", { conversationId: context.conversationId, targetMessageId, error: String(error) });
+      warnOnce("switch-failed", failureMessage, { error: String(error) });
     } finally {
       pendingConversations.delete(context.conversationId);
       schedule();
     }
+  };
+
+  const switchVersion = async (bubble, direction) => {
+    const context = readContext(bubble);
+    if (!context || pendingConversations.has(context.conversationId)) return;
+    const graph = graphFor(context);
+    if (!graph || !hydrateGraph(context, graph)) return;
+    const ids = variants(graph, context.messageId);
+    const index = ids.indexOf(context.messageId);
+    const target = index < 0 ? null : ids[index + direction];
+    if (!target) return;
+    await requestSwitch(context, context.messageId, target, labels().failed);
   };
 
   const paint = (bubble, context, graph, mountInfo, currentPass) => {
@@ -586,7 +604,7 @@
     if (controls.parentElement !== mount) mount.append(controls);
     const [previous, counter, next] = controls.children;
     const caption = `${index + 1}/${ids.length}`;
-    counter.textContent = caption;
+    if (counter.textContent !== caption) counter.textContent = caption;
     const busy = pendingConversations.has(context.conversationId);
     previous.disabled = busy || index === 0;
     next.disabled = busy || index === ids.length - 1;
@@ -606,42 +624,143 @@
     }
   };
 
-  const nativeAssistantPaginationFor = (message) => {
+  const assistantActionRowFor = (message) => {
     let element = message.parentElement;
     for (let depth = 0; element && depth < 10; depth++, element = element.parentElement) {
       if (element.querySelectorAll(ASSISTANT_MESSAGE).length !== 1) continue;
       for (const row of element.querySelectorAll(".turn-action-controls")) {
-        const previous = row.querySelector(
-          'button[aria-label="Previous response"], button[aria-label="Предыдущий ответ"]',
-        );
-        const next = row.querySelector(
-          'button[aria-label="Next response"], button[aria-label="Следующий ответ"]',
-        );
-        if (!previous || !next || previous.parentElement !== next.parentElement) continue;
-        const wrapper = previous.parentElement;
-        if (/^\s*\d+\s*\/\s*\d+\s*$/.test(wrapper.textContent ?? "")) return wrapper;
+        if (row.querySelector(
+          'button[aria-label="Regenerate response"], button[aria-label="Сгенерировать ответ заново"]',
+        )) return row;
       }
     }
     return null;
   };
 
-  const suppressPhantomAssistantPagination = () => {
+  const nativeAssistantPaginationFor = (row) => {
+    if (!row) return null;
+    const previousButtons = row.querySelectorAll(
+      'button[aria-label="Previous response"], button[aria-label="Предыдущий ответ"]',
+    );
+    const nextButtons = [...row.querySelectorAll(
+      'button[aria-label="Next response"], button[aria-label="Следующий ответ"]',
+    )];
+    for (const previous of previousButtons) {
+      const wrapper = previous.parentElement;
+      if (!wrapper || wrapper.matches(ASSISTANT_CONTROLS)) continue;
+      const next = nextButtons.find((candidate) => candidate.parentElement === wrapper);
+      if (next && /^\s*\d+\s*\/\s*\d+\s*$/.test(wrapper.textContent ?? "")) return wrapper;
+    }
+    return null;
+  };
+
+  const contextForConversation = (conversationId) => {
+    for (const bubble of document.querySelectorAll(USER_BUBBLE)) {
+      const context = readContext(bubble);
+      if (context?.conversationId === conversationId) return context;
+    }
+    return null;
+  };
+
+  const switchAssistantVersion = async (messageId, direction) => {
+    const graph = [...graphs.values()].find((candidate) => candidate.mapping[messageId]);
+    if (!graph) return;
+    const context = contextForConversation(graph.conversationId);
+    if (!context || pendingConversations.has(context.conversationId) || !hydrateGraph(context, graph)) return;
+    const ids = assistantVariants(graph, messageId);
+    const index = ids.indexOf(messageId);
+    const target = index < 0 ? null : ids[index + direction];
+    if (!target) return;
+    await requestSwitch(context, messageId, target, assistantLabels().failed);
+  };
+
+  const paintAssistantPagination = (message, context, graph, row, currentPass) => {
+    const messageId = message.getAttribute("data-chatgpt-selection-message-id");
+    if (!messageId) return false;
+    for (const button of row.querySelectorAll('button[aria-label="See versions"]')) {
+      if (!button.hasAttribute("data-batch-pagination-suppressed")) {
+        button.setAttribute("data-batch-pagination-suppressed", "");
+        record("native-versions-suppressed", { role: "assistant", messageId });
+      }
+    }
+    const ids = assistantVariants(graph, messageId);
+    const index = ids.indexOf(messageId);
+    const native = nativeAssistantPaginationFor(row);
+    let controls = row.querySelector(ASSISTANT_CONTROLS);
+    if (native) {
+      const phantom = ids.length < 2;
+      if (phantom && !native.hasAttribute("data-batch-pagination-suppressed")) {
+        native.setAttribute("data-batch-pagination-suppressed", "");
+        record("phantom-assistant-pagination-suppressed", { messageId });
+      } else if (!phantom && native.hasAttribute("data-batch-pagination-suppressed")) {
+        native.removeAttribute("data-batch-pagination-suppressed");
+        record("assistant-pagination-restored", { messageId });
+      }
+      controls?.remove();
+      return false;
+    }
+    if (ids.length < 2 || index < 0 || !context) {
+      controls?.remove();
+      return false;
+    }
+    if (!controls) {
+      const text = assistantLabels();
+      controls = document.createElement("span");
+      controls.setAttribute("data-batch-edit-pagination", "");
+      controls.setAttribute("data-batch-assistant-pagination", "");
+      controls.setAttribute("role", "group");
+      controls.setAttribute("aria-label", text.group);
+      const previous = createButton(text.previous, -1, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void switchAssistantVersion(controls.dataset.messageId, -1);
+      });
+      const counter = document.createElement("span");
+      counter.setAttribute("aria-live", "polite");
+      counter.setAttribute("aria-atomic", "true");
+      const next = createButton(text.next, 1, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void switchAssistantVersion(controls.dataset.messageId, 1);
+      });
+      controls.append(previous, counter, next);
+    }
+    controls.dataset.pass = String(currentPass);
+    controls.dataset.conversationId = context.conversationId;
+    controls.dataset.messageId = messageId;
+    const more = row.querySelector('button[aria-label="More actions"], button[aria-label="Ещё действия"]');
+    let insertionPoint = more;
+    while (insertionPoint && insertionPoint.parentElement !== row) insertionPoint = insertionPoint.parentElement;
+    if (controls.parentElement !== row || (insertionPoint && controls.nextElementSibling !== insertionPoint)) {
+      row.insertBefore(controls, insertionPoint);
+    }
+    const [previous, counter, next] = controls.children;
+    const caption = `${index + 1}/${ids.length}`;
+    if (counter.textContent !== caption) counter.textContent = caption;
+    const busy = pendingConversations.has(context.conversationId);
+    previous.disabled = busy || index === 0;
+    next.disabled = busy || index === ids.length - 1;
+    controls.setAttribute("aria-busy", String(busy));
+    const error = conversationErrors.get(context.conversationId) ?? "";
+    controls.title = error;
+    counter.setAttribute("aria-label", error ? `${caption}. ${error}` : caption);
+    return true;
+  };
+
+  const reconcileAssistantPagination = (currentPass, contexts) => {
+    let painted = 0;
     for (const message of document.querySelectorAll(ASSISTANT_MESSAGE)) {
       const messageId = message.getAttribute("data-chatgpt-selection-message-id");
       if (!messageId) continue;
       const graph = [...graphs.values()].find((candidate) => candidate.mapping[messageId]);
       if (!graph) continue;
-      const wrapper = nativeAssistantPaginationFor(message);
-      if (!wrapper) continue;
-      const phantom = assistantVariants(graph, messageId).length < 2;
-      if (phantom && !wrapper.hasAttribute("data-batch-pagination-suppressed")) {
-        wrapper.setAttribute("data-batch-pagination-suppressed", "");
-        record("phantom-assistant-pagination-suppressed", { messageId });
-      } else if (!phantom && wrapper.hasAttribute("data-batch-pagination-suppressed")) {
-        wrapper.removeAttribute("data-batch-pagination-suppressed");
-        record("assistant-pagination-restored", { messageId });
-      }
+      const context = contexts.get(graph.conversationId) ?? null;
+      if (context && !hydrateGraph(context, graph)) continue;
+      const row = assistantActionRowFor(message);
+      if (!row) continue;
+      if (paintAssistantPagination(message, context, graph, row, currentPass)) painted++;
     }
+    return painted;
   };
 
   const candidateSource = (value) => {
@@ -763,6 +882,7 @@
       return;
     }
     const bubbles = [...document.querySelectorAll(USER_BUBBLE)];
+    const contexts = new Map();
     let painted = 0;
     for (const bubble of bubbles) {
       const mountInfo = findMount(bubble);
@@ -770,16 +890,17 @@
       suppressNativeVersions(mountInfo);
       const context = readContext(bubble);
       if (!context) continue;
+      contexts.set(context.conversationId, context);
       const graph = graphFor(context);
       if (!graph) continue;
       if (!hydrateGraph(context, graph)) continue;
       if (paint(bubble, context, graph, mountInfo, currentPass)) painted++;
     }
+    const assistantPainted = reconcileAssistantPagination(currentPass, contexts);
     for (const controls of document.querySelectorAll(CONTROLS)) {
       if (controls.dataset.pass !== String(currentPass)) controls.remove();
     }
-    suppressPhantomAssistantPagination();
-    record("render", { bubbleCount: bubbles.length, painted, graphCount: graphs.size });
+    record("render", { bubbleCount: bubbles.length, painted, assistantPainted, graphCount: graphs.size });
     if (bubbles.length && graphs.size && !runtime) void discoverRuntime();
     else if (runtime && !switcher) scanSwitcher();
   };
