@@ -1,15 +1,17 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.8.0-batch-test.1";
+  const VERSION = "0.8.0-batch-test.7";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
+  const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
   const CONTROLS = "[data-batch-edit-pagination]";
   const BATCH_PATH = "/backend-api/conversations/batch";
   const RUNTIME_HINT = /^\/cdn\/assets\/633146\.[a-z0-9]+\.js$/;
   const MAX_GRAPHS = 3;
   const MAX_EVENTS = 500;
   const graphs = new Map();
+  const scopeAdapters = new WeakMap();
   const pendingConversations = new Set();
   const conversationErrors = new Map();
   const attemptedRuntimeUrls = new Set();
@@ -21,6 +23,9 @@
     batchCaptures: 0,
     renders: 0,
     contextScans: 0,
+    scopeScans: 0,
+    scopeHydrations: 0,
+    scopeHydrationFailures: 0,
     runtimeImports: 0,
     runtimeImportFailures: 0,
     switcherScans: 0,
@@ -29,7 +34,6 @@
   };
   let latestBatchPayload = null;
   let runtime = null;
-  let runtimeCleanup = null;
   let switcher = null;
   let runtimeDiscovery = null;
   let frame = null;
@@ -37,6 +41,7 @@
   let rootObserver = null;
   let stopped = false;
   let pass = 0;
+  let graphRevision = 0;
 
   const record = (type, details = {}) => {
     diagnostics.events.push({ at: new Date().toISOString(), type, ...details });
@@ -69,50 +74,211 @@
     return method === "POST" && url?.origin === location.origin && url.pathname === BATCH_PATH;
   };
 
+  const cloneNode = (node) => ({
+    ...node,
+    children: Array.isArray(node?.children)
+      ? node.children.filter((childId) => typeof childId === "string")
+      : [],
+  });
+
+  const cloneMapping = (mapping) => Object.fromEntries(
+    Object.entries(mapping ?? {})
+      .filter(([, node]) => node && typeof node === "object")
+      .map(([id, node]) => [id, cloneNode(node)]),
+  );
+
+  const compactMapping = (source) => {
+    const compact = {};
+    for (const [id, node] of Object.entries(source ?? {})) {
+      if (!node || typeof node !== "object") continue;
+      const role = typeof node.message?.author?.role === "string" ? node.message.author.role : null;
+      const contentType = typeof node.message?.content?.content_type === "string"
+        ? node.message.content.content_type
+        : null;
+      const parts = Array.isArray(node.message?.content?.parts) ? node.message.content.parts : [];
+      const hidden = node.message?.metadata?.is_visually_hidden_from_conversation === true;
+      compact[id] = {
+        parent: typeof node.parent === "string" ? node.parent : null,
+        children: Array.isArray(node.children)
+          ? node.children.filter((childId) => typeof childId === "string")
+          : [],
+        role,
+        createTime: Number.isFinite(node.message?.create_time) ? node.message.create_time : null,
+        visibleRole: !hidden && role === "user"
+          ? "user"
+          : !hidden && role === "assistant" &&
+            (contentType === null || contentType === "text" || contentType === "multimodal_text") &&
+            parts.some((part) =>
+            typeof part === "string" ? part.length > 0 : part != null)
+            ? "assistant"
+            : null,
+      };
+    }
+    return compact;
+  };
+
+  const userVariantAnchor = (graph, messageId) => {
+    const node = graph?.mapping?.[messageId];
+    if (node?.role !== "user" || !node.parent) return null;
+    let cursor = node.parent;
+    let highestTransparent = cursor;
+    const visited = new Set();
+    while (cursor && !visited.has(cursor)) {
+      visited.add(cursor);
+      const candidate = graph.mapping[cursor];
+      if (!candidate) break;
+      if (candidate.visibleRole) return cursor;
+      highestTransparent = cursor;
+      cursor = candidate.parent;
+    }
+    return highestTransparent;
+  };
+
+  const userVariants = (graph, messageId) => {
+    const anchor = userVariantAnchor(graph, messageId);
+    if (!anchor) return [];
+    const result = [];
+    const queue = [...(graph.mapping[anchor]?.children ?? [])];
+    const visited = new Set([anchor]);
+    while (queue.length) {
+      const id = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const node = graph.mapping[id];
+      if (!node) continue;
+      if (node.visibleRole) {
+        if (node.visibleRole === "user") result.push(id);
+        continue;
+      }
+      queue.push(...node.children);
+    }
+    if (!result.includes(messageId)) return [];
+    return result.sort((left, right) => {
+      const leftTime = graph.mapping[left]?.createTime;
+      const rightTime = graph.mapping[right]?.createTime;
+      if (leftTime === null && rightTime === null) return 0;
+      if (leftTime === null) return 1;
+      if (rightTime === null) return -1;
+      return leftTime - rightTime;
+    });
+  };
+
+  const assistantVariants = (graph, messageId) => {
+    const node = graph?.mapping?.[messageId];
+    if (node?.visibleRole !== "assistant" || !node.parent) return [];
+    let anchor = node.parent;
+    const parents = new Set([messageId]);
+    while (anchor && !parents.has(anchor)) {
+      parents.add(anchor);
+      const candidate = graph.mapping[anchor];
+      if (!candidate) return [];
+      if (candidate.visibleRole === "user") break;
+      if (candidate.visibleRole === "assistant") return [];
+      anchor = candidate.parent;
+    }
+    if (graph.mapping[anchor]?.visibleRole !== "user") return [];
+    const result = [];
+    const queue = [...(graph.mapping[anchor]?.children ?? [])];
+    const visited = new Set([anchor]);
+    while (queue.length) {
+      const id = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const candidate = graph.mapping[id];
+      if (!candidate) continue;
+      if (candidate.visibleRole) {
+        if (candidate.visibleRole === "assistant") result.push(id);
+        continue;
+      }
+      queue.push(...candidate.children);
+    }
+    if (!result.includes(messageId)) return [];
+    return result.sort((left, right) => {
+      const leftTime = graph.mapping[left]?.createTime;
+      const rightTime = graph.mapping[right]?.createTime;
+      if (leftTime === null && rightTime === null) return 0;
+      if (leftTime === null) return 1;
+      if (rightTime === null) return -1;
+      return leftTime - rightTime;
+    });
+  };
+
+  const mergeMappings = (batchMapping, liveMapping) => {
+    const merged = cloneMapping(batchMapping);
+    for (const [id, liveNode] of Object.entries(liveMapping ?? {})) {
+      if (!liveNode || typeof liveNode !== "object") continue;
+      const batchNode = merged[id];
+      if (!batchNode) {
+        merged[id] = cloneNode(liveNode);
+        continue;
+      }
+      merged[id] = {
+        ...batchNode,
+        ...liveNode,
+        // The paginated shell rewrites the first retained node to a synthetic
+        // root. The batch graph remains authoritative for nodes it already has.
+        parent: batchNode.parent,
+        children: [...new Set([...(batchNode.children ?? []), ...(liveNode.children ?? [])])],
+      };
+    }
+    // The paginated shell adds shortcut child edges when it rebases a retained
+    // slice onto its synthetic root. Those edges are not real graph branches
+    // and make the native assistant pager count duplicate responses. Keep only
+    // edges that agree with the child's authoritative parent, then rebuild any
+    // missing parent-to-child links below.
+    for (const [id, node] of Object.entries(merged)) {
+      node.children = [...new Set(node.children ?? [])]
+        .filter((childId) => merged[childId]?.parent === id);
+    }
+    for (const [id, node] of Object.entries(merged)) {
+      if (!node.parent || !merged[node.parent]) continue;
+      const parent = merged[node.parent];
+      if (!parent.children.includes(id)) parent.children = [...parent.children, id];
+    }
+    return merged;
+  };
+
   const compactGraph = (payload) => {
     if (!payload || typeof payload !== "object" || !payload.mapping || typeof payload.mapping !== "object") {
       return null;
     }
     const conversationId = String(payload.conversation_id ?? payload.id ?? "");
     if (!conversationId) return null;
-    const mapping = {};
-    for (const [id, node] of Object.entries(payload.mapping)) {
-      if (!node || typeof node !== "object") continue;
-      mapping[id] = {
-        parent: typeof node.parent === "string" ? node.parent : null,
-        children: Array.isArray(node.children)
-          ? node.children.filter((childId) => typeof childId === "string")
-          : [],
-        role: typeof node.message?.author?.role === "string" ? node.message.author.role : null,
-      };
-    }
+    const batchMapping = cloneMapping(payload.mapping);
     return {
       conversationId,
       currentNode: typeof payload.current_node === "string" ? payload.current_node : null,
-      mapping,
+      batchMapping,
+      liveMapping: batchMapping,
+      mapping: compactMapping(batchMapping),
+      revision: ++graphRevision,
     };
   };
 
   const graphSummary = (graph) => {
-    let userVariantGroups = 0;
-    let assistantVariantGroups = 0;
+    const userGroups = new Set();
+    const assistantGroups = new Set();
     let maxUserVariants = 0;
-    for (const node of Object.values(graph.mapping)) {
+    for (const [id, node] of Object.entries(graph.mapping)) {
       if (!Array.isArray(node.children)) continue;
-      const userChildren = node.children.filter((id) => graph.mapping[id]?.role === "user").length;
-      const assistantChildren = node.children.filter((id) => graph.mapping[id]?.role === "assistant").length;
-      if (userChildren > 1) {
-        userVariantGroups++;
-        maxUserVariants = Math.max(maxUserVariants, userChildren);
+      if (node.role === "user") {
+        const ids = userVariants(graph, id);
+        if (ids.length > 1) {
+          userGroups.add(ids.join("\0"));
+          maxUserVariants = Math.max(maxUserVariants, ids.length);
+        }
       }
-      if (assistantChildren > 1) assistantVariantGroups++;
+      if (node.visibleRole === "assistant") {
+        const ids = assistantVariants(graph, id);
+        if (ids.length > 1) assistantGroups.add(ids.join("\0"));
+      }
     }
     return {
       conversationId: graph.conversationId,
       currentNode: graph.currentNode,
       mappingCount: Object.keys(graph.mapping).length,
-      userVariantGroups,
-      assistantVariantGroups,
+      userVariantGroups: userGroups.size,
+      assistantVariantGroups: assistantGroups.size,
       maxUserVariants,
     };
   };
@@ -206,13 +372,99 @@
   const graphFor = (context) => graphs.get(context.conversationId) ??
     [...graphs.values()].find((graph) => graph.mapping[context.messageId]) ?? null;
 
-  const variants = (graph, messageId, role = "user") => {
-    const node = graph?.mapping?.[messageId];
-    if (!node || node.role !== role || !node.parent) return [];
-    const children = graph.mapping[node.parent]?.children;
-    if (!Array.isArray(children)) return [];
-    return [...new Set(children)].filter((id) => graph.mapping[id]?.parent === node.parent && graph.mapping[id]?.role === role);
+  const mappingScore = (value, graph, messageId) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return -1;
+    if (!value[messageId] && !(graph.currentNode && value[graph.currentNode])) return -1;
+    const nodes = Object.values(value);
+    if (!nodes.some((node) => node && typeof node === "object" &&
+        Array.isArray(node.children) && "parent" in node && "message" in node)) return -1;
+    let knownNodes = 0;
+    for (const id of Object.keys(graph.mapping)) if (value[id]) knownNodes++;
+    return knownNodes * 100 + Math.min(nodes.length, 99);
   };
+
+  const adapterCacheFor = (scope) => {
+    const owner = scope.node ?? scope;
+    let cache = scopeAdapters.get(owner);
+    if (!cache) {
+      cache = new Map();
+      scopeAdapters.set(owner, cache);
+    }
+    return cache;
+  };
+
+  const discoverScopeAdapter = (context, graph) => {
+    const cache = adapterCacheFor(context.scope);
+    const cached = cache.get(context.conversationId);
+    if (cached) {
+      try {
+        context.scope.get(cached.mappingSignal, context.conversationId);
+        return cached;
+      } catch {
+        cache.delete(context.conversationId);
+      }
+    }
+    diagnostics.scopeScans++;
+    let best = null;
+    const families = context.scope.node?.familyBindings;
+    if (!families || typeof families.keys !== "function") return null;
+    for (const atom of families.keys()) {
+      if (atom?.kind !== "signal-family") continue;
+      let value;
+      try {
+        value = context.scope.get(atom, context.conversationId);
+      } catch {
+        continue;
+      }
+      const score = mappingScore(value, graph, context.messageId);
+      if (score < 0 || (best && best.score >= score)) continue;
+      best = { mappingSignal: atom, score };
+    }
+    if (!best) return null;
+    const adapter = { mappingSignal: best.mappingSignal, lastApplied: null, lastRevision: 0 };
+    cache.set(context.conversationId, adapter);
+    record("scope-adapter-found", {
+      conversationId: context.conversationId,
+      mappingScore: best.score,
+    });
+    return adapter;
+  };
+
+  const hydrateGraph = (context, graph) => {
+    const adapter = discoverScopeAdapter(context, graph);
+    if (!adapter) return false;
+    let liveMapping;
+    try {
+      liveMapping = context.scope.get(adapter.mappingSignal, context.conversationId);
+    } catch (error) {
+      diagnostics.scopeHydrationFailures++;
+      record("scope-hydration-failed", { conversationId: context.conversationId, error: String(error) });
+      return false;
+    }
+    if (liveMapping === adapter.lastApplied && adapter.lastRevision === graph.revision) return true;
+    const merged = mergeMappings(graph.liveMapping ?? graph.batchMapping, liveMapping);
+    graph.liveMapping = merged;
+    graph.mapping = compactMapping(merged);
+    try {
+      context.scope.set(adapter.mappingSignal, context.conversationId, merged);
+      adapter.lastApplied = merged;
+      adapter.lastRevision = graph.revision;
+      diagnostics.scopeHydrations++;
+      record("scope-hydrated", {
+        conversationId: context.conversationId,
+        batchMappingCount: Object.keys(graph.batchMapping).length,
+        liveMappingCount: Object.keys(liveMapping ?? {}).length,
+        mergedMappingCount: Object.keys(merged).length,
+      });
+      return true;
+    } catch (error) {
+      diagnostics.scopeHydrationFailures++;
+      record("scope-hydration-failed", { conversationId: context.conversationId, error: String(error) });
+      return false;
+    }
+  };
+
+  const variants = (graph, messageId) => userVariants(graph, messageId);
 
   const findMount = (bubble) => {
     let element = bubble.parentElement;
@@ -263,6 +515,7 @@
     const context = readContext(bubble);
     if (!context || pendingConversations.has(context.conversationId)) return;
     const graph = graphFor(context);
+    if (!graph || !hydrateGraph(context, graph)) return;
     const ids = variants(graph, context.messageId);
     const index = ids.indexOf(context.messageId);
     const target = index < 0 ? null : ids[index + direction];
@@ -353,6 +606,44 @@
     }
   };
 
+  const nativeAssistantPaginationFor = (message) => {
+    let element = message.parentElement;
+    for (let depth = 0; element && depth < 10; depth++, element = element.parentElement) {
+      if (element.querySelectorAll(ASSISTANT_MESSAGE).length !== 1) continue;
+      for (const row of element.querySelectorAll(".turn-action-controls")) {
+        const previous = row.querySelector(
+          'button[aria-label="Previous response"], button[aria-label="Предыдущий ответ"]',
+        );
+        const next = row.querySelector(
+          'button[aria-label="Next response"], button[aria-label="Следующий ответ"]',
+        );
+        if (!previous || !next || previous.parentElement !== next.parentElement) continue;
+        const wrapper = previous.parentElement;
+        if (/^\s*\d+\s*\/\s*\d+\s*$/.test(wrapper.textContent ?? "")) return wrapper;
+      }
+    }
+    return null;
+  };
+
+  const suppressPhantomAssistantPagination = () => {
+    for (const message of document.querySelectorAll(ASSISTANT_MESSAGE)) {
+      const messageId = message.getAttribute("data-chatgpt-selection-message-id");
+      if (!messageId) continue;
+      const graph = [...graphs.values()].find((candidate) => candidate.mapping[messageId]);
+      if (!graph) continue;
+      const wrapper = nativeAssistantPaginationFor(message);
+      if (!wrapper) continue;
+      const phantom = assistantVariants(graph, messageId).length < 2;
+      if (phantom && !wrapper.hasAttribute("data-batch-pagination-suppressed")) {
+        wrapper.setAttribute("data-batch-pagination-suppressed", "");
+        record("phantom-assistant-pagination-suppressed", { messageId });
+      } else if (!phantom && wrapper.hasAttribute("data-batch-pagination-suppressed")) {
+        wrapper.removeAttribute("data-batch-pagination-suppressed");
+        record("assistant-pagination-restored", { messageId });
+      }
+    }
+  };
+
   const candidateSource = (value) => {
     try {
       return Function.prototype.toString.call(value);
@@ -406,45 +697,50 @@
     runtime = candidate;
     record("runtime-found", { cacheSize: Object.keys(runtime.c).length });
     scanSwitcher();
-    if (typeof runtime.C === "function") {
-      const originalRegister = runtime.C;
-      const register = function (...args) {
-        const result = Reflect.apply(originalRegister, this, args);
-        queueMicrotask(() => {
-          scanSwitcher();
-          schedule();
-        });
-        return result;
-      };
-      runtime.C = register;
-      runtimeCleanup = () => {
-        if (runtime?.C === register) runtime.C = originalRegister;
-      };
-    }
     return true;
+  };
+
+  const runtimeUrls = () => {
+    const paths = [];
+    const manifest = globalThis.__reactRouterManifest;
+    if (Array.isArray(manifest?.entry?.imports)) paths.push(...manifest.entry.imports);
+    if (typeof manifest?.entry?.module === "string") paths.push(manifest.entry.module);
+    for (const link of document.querySelectorAll('link[rel="modulepreload"][href]')) paths.push(link.href);
+    for (const script of document.scripts) {
+      for (const match of script.textContent?.matchAll?.(/\bimport\(["']([^"']+\.js)["']\)/g) ?? []) {
+        paths.push(match[1]);
+      }
+    }
+    const urls = [];
+    for (const path of paths) {
+      try {
+        const url = new URL(path, location.href);
+        if (url.origin === location.origin && url.pathname.endsWith(".js")) urls.push(url);
+      } catch {
+        // A malformed manifest entry is simply not a runtime candidate.
+      }
+    }
+    const unique = [...new Map(urls.map((url) => [url.href, url])).values()];
+    unique.sort((a, b) => Number(RUNTIME_HINT.test(b.pathname)) - Number(RUNTIME_HINT.test(a.pathname)));
+    return unique;
   };
 
   async function discoverRuntime() {
     if (runtime || stopped) return runtime;
     if (runtimeDiscovery) return runtimeDiscovery;
     runtimeDiscovery = (async () => {
-      const urls = [...document.querySelectorAll('link[rel="modulepreload"][href]')]
-        .map((link) => {
-          try {
-            return new URL(link.href, location.href);
-          } catch {
-            return null;
-          }
-        })
-        .filter((url) => url?.origin === location.origin && url.pathname.endsWith(".js"));
-      urls.sort((a, b) => Number(RUNTIME_HINT.test(b.pathname)) - Number(RUNTIME_HINT.test(a.pathname)));
+      const urls = runtimeUrls();
+      record("runtime-candidates", { count: urls.length, urls: urls.map((url) => url.pathname) });
       for (const url of urls) {
         if (attemptedRuntimeUrls.has(url.href)) continue;
         attemptedRuntimeUrls.add(url.href);
         diagnostics.runtimeImports++;
         try {
           const module = await import(url.href);
-          if (attachRuntime(module.__webpack_require__)) break;
+          if (attachRuntime(module.__webpack_require__)) {
+            record("runtime-imported", { url: url.pathname });
+            break;
+          }
         } catch (error) {
           diagnostics.runtimeImportFailures++;
           record("runtime-import-failed", { url: url.href, error: String(error) });
@@ -476,11 +772,13 @@
       if (!context) continue;
       const graph = graphFor(context);
       if (!graph) continue;
+      if (!hydrateGraph(context, graph)) continue;
       if (paint(bubble, context, graph, mountInfo, currentPass)) painted++;
     }
     for (const controls of document.querySelectorAll(CONTROLS)) {
       if (controls.dataset.pass !== String(currentPass)) controls.remove();
     }
+    suppressPhantomAssistantPagination();
     record("render", { bubbleCount: bubbles.length, painted, graphCount: graphs.size });
     if (bubbles.length && graphs.size && !runtime) void discoverRuntime();
     else if (runtime && !switcher) scanSwitcher();
@@ -493,6 +791,7 @@
 
   const mutationMatters = (mutation) => {
     if (mutation.type === "attributes") return true;
+    if (mutation.target?.nodeType === 1 && mutation.target.closest?.(".turn-action-controls")) return true;
     const relevant = (node) => node.nodeType === 1 &&
       (node.matches?.(USER_BUBBLE) || node.querySelector?.(USER_BUBBLE) ||
        node.matches?.(".turn-action-controls") || node.querySelector?.(".turn-action-controls") ||
@@ -529,7 +828,13 @@
       ...diagnostics,
       events: diagnostics.events.slice(),
     },
-    graphs: [...graphs.values()].map((graph) => ({ ...graph, summary: graphSummary(graph) })),
+    graphs: [...graphs.values()].map((graph) => ({
+      conversationId: graph.conversationId,
+      currentNode: graph.currentNode,
+      revision: graph.revision,
+      mapping: graph.mapping,
+      summary: graphSummary(graph),
+    })),
     latestBatchPayload,
     controls: [...document.querySelectorAll(CONTROLS)].map((controls) => ({
       conversationId: controls.dataset.conversationId ?? null,
@@ -573,7 +878,6 @@
     if (frame !== null) cancelAnimationFrame(frame);
     observer?.disconnect();
     rootObserver?.disconnect();
-    runtimeCleanup?.();
   }, { once: true });
 
   globalThis.__chatgptBatchPagination = {
@@ -585,12 +889,17 @@
   if (globalThis.__CHATGPT_EDIT_PAGINATION_PATCH_TEST__ === true) {
     globalThis.__chatgptBatchPaginationTest = {
       attachRuntime,
+      assistantVariants,
       captureBatch,
       compactGraph,
       graphFor,
       graphSummary,
+      hydrateGraph,
       isBatchRequest,
+      mergeMappings,
+      mutationMatters,
       readContext,
+      runtimeUrls,
       scanSwitcher,
       variants,
     };
