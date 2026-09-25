@@ -1,6 +1,6 @@
 [data-batch-edit-pagination] {
   align-items: center;
-  color: var(--text-secondary, currentColor);
+  color: var(--color-text-tertiary, currentColor);
   display: inline-flex;
   font-size: 0.75rem;
   gap: 0.125rem;

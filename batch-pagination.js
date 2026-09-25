@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.8.0-batch-test.15";
+  const VERSION = "0.8.0-batch-test.16";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
