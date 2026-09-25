@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.8.0-batch-test.14";
+  const VERSION = "0.8.0-batch-test.15";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
@@ -73,10 +73,12 @@
     }
   };
 
-  const isBatchResponse = (response) => {
+  const batchResponseUrl = (response) => {
     const url = responseUrl(response);
-    return url?.origin === location.origin && url.pathname === BATCH_PATH;
+    return url?.origin === location.origin && url.pathname === BATCH_PATH ? url.href : null;
   };
+
+  const isBatchResponse = (response) => batchResponseUrl(response) !== null;
 
   const cloneNode = (node) => ({
     ...node,
@@ -310,28 +312,18 @@
     return captured.length;
   };
 
-  const observeBatchPayload = (response, payload, source) => {
-    if (observedBatchResponses.has(response)) return;
-    observedBatchResponses.add(response);
+  const observeBatchPayload = (responseKey, payload, source, url) => {
+    if (observedBatchResponses.has(responseKey)) return;
+    observedBatchResponses.add(responseKey);
     diagnostics.batchResponses++;
-    const url = responseUrl(response);
-    record("batch-response", {
-      url: url?.href ?? String(response.url ?? ""),
-      status: response.status,
-      source,
-    });
-    if (!response.ok) {
-      warnOnce("batch-http", `The batch response returned HTTP ${response.status}.`, { status: response.status });
-      return;
-    }
-    captureBatch(payload, response.url);
+    record("batch-response", { url, source });
+    captureBatch(payload, url);
   };
 
-  const observeBatchError = (response, error) => {
-    const url = responseUrl(response);
+  const observeBatchError = (url, error) => {
     warnOnce("batch-json", "The batch response could not be parsed.", {
       error: String(error),
-      url: url?.href ?? String(response?.url ?? ""),
+      url,
     });
   };
 
@@ -340,15 +332,16 @@
     if (typeof Response.prototype.json === "function") {
       const originalResponseJson = Response.prototype.json;
       Response.prototype.json = function observedBatchResponseJson(...args) {
+        const url = batchResponseUrl(this);
         const parsedPromise = Reflect.apply(originalResponseJson, this, args);
-        if (!isBatchResponse(this)) return parsedPromise;
+        if (url === null) return parsedPromise;
         return parsedPromise.then(
           (payload) => {
-            observeBatchPayload(this, payload, "json");
+            observeBatchPayload(this, payload, "json", url);
             return payload;
           },
           (error) => {
-            observeBatchError(this, error);
+            observeBatchError(url, error);
             throw error;
           },
         );
@@ -357,19 +350,20 @@
     if (typeof Response.prototype.text === "function") {
       const originalResponseText = Response.prototype.text;
       Response.prototype.text = function observedBatchResponseText(...args) {
+        const url = batchResponseUrl(this);
         const textPromise = Reflect.apply(originalResponseText, this, args);
-        if (!isBatchResponse(this)) return textPromise;
+        if (url === null) return textPromise;
         return textPromise.then(
           (text) => {
             try {
-              observeBatchPayload(this, JSON.parse(text), "text");
+              observeBatchPayload(this, JSON.parse(text), "text", url);
             } catch (error) {
-              observeBatchError(this, error);
+              observeBatchError(url, error);
             }
             return text;
           },
           (error) => {
-            observeBatchError(this, error);
+            observeBatchError(url, error);
             throw error;
           },
         );
