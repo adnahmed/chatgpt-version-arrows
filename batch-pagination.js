@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.8.0-batch-test.13";
+  const VERSION = "0.8.0-batch-test.14";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
@@ -20,12 +20,13 @@
   const scopeAdapters = new WeakMap();
   const pendingConversations = new Set();
   const conversationErrors = new Map();
+  const observedBatchResponses = new WeakSet();
   const attemptedRuntimeUrls = new Set();
   const warned = new Set();
   const diagnostics = {
     version: VERSION,
     installedAt: new Date().toISOString(),
-    batchRequests: 0,
+    batchResponses: 0,
     batchCaptures: 0,
     renders: 0,
     contextScans: 0,
@@ -64,20 +65,17 @@
 
   const isShell = () => document.documentElement?.hasAttribute(SHELL_ATTRIBUTE) === true;
 
-  const requestDetails = (input, init) => {
-    const request = typeof Request !== "undefined" && input instanceof Request ? input : null;
-    const method = String(init?.method ?? request?.method ?? "GET").toUpperCase();
-    const rawUrl = request?.url ?? (input instanceof URL ? input.href : String(input ?? ""));
+  const responseUrl = (response) => {
     try {
-      return { method, url: new URL(rawUrl, location.href) };
+      return new URL(String(response?.url ?? ""), location.href);
     } catch {
-      return { method, url: null };
+      return null;
     }
   };
 
-  const isBatchRequest = (input, init) => {
-    const { method, url } = requestDetails(input, init);
-    return method === "POST" && url?.origin === location.origin && url.pathname === BATCH_PATH;
+  const isBatchResponse = (response) => {
+    const url = responseUrl(response);
+    return url?.origin === location.origin && url.pathname === BATCH_PATH;
   };
 
   const cloneNode = (node) => ({
@@ -312,28 +310,71 @@
     return captured.length;
   };
 
+  const observeBatchPayload = (response, payload, source) => {
+    if (observedBatchResponses.has(response)) return;
+    observedBatchResponses.add(response);
+    diagnostics.batchResponses++;
+    const url = responseUrl(response);
+    record("batch-response", {
+      url: url?.href ?? String(response.url ?? ""),
+      status: response.status,
+      source,
+    });
+    if (!response.ok) {
+      warnOnce("batch-http", `The batch response returned HTTP ${response.status}.`, { status: response.status });
+      return;
+    }
+    captureBatch(payload, response.url);
+  };
+
+  const observeBatchError = (response, error) => {
+    const url = responseUrl(response);
+    warnOnce("batch-json", "The batch response could not be parsed.", {
+      error: String(error),
+      url: url?.href ?? String(response?.url ?? ""),
+    });
+  };
+
   const installBatchObserver = () => {
-    if (typeof window.fetch !== "function") return;
-    const originalFetch = window.fetch;
-    window.fetch = function observedFetch(input, init) {
-      const batch = isBatchRequest(input, init);
-      const responsePromise = Reflect.apply(originalFetch, this, arguments);
-      if (!batch) return responsePromise;
-      diagnostics.batchRequests++;
-      const { url } = requestDetails(input, init);
-      record("batch-request", { url: url?.href ?? String(input ?? "") });
-      void responsePromise.then((response) => {
-        if (!response.ok) {
-          warnOnce("batch-http", `The batch request returned HTTP ${response.status}.`, { status: response.status });
-          return;
-        }
-        return response.clone().json().then(
-          (payload) => captureBatch(payload, response.url),
-          (error) => warnOnce("batch-json", "The batch response could not be parsed.", { error: String(error) }),
+    if (typeof Response === "undefined") return;
+    if (typeof Response.prototype.json === "function") {
+      const originalResponseJson = Response.prototype.json;
+      Response.prototype.json = function observedBatchResponseJson(...args) {
+        const parsedPromise = Reflect.apply(originalResponseJson, this, args);
+        if (!isBatchResponse(this)) return parsedPromise;
+        return parsedPromise.then(
+          (payload) => {
+            observeBatchPayload(this, payload, "json");
+            return payload;
+          },
+          (error) => {
+            observeBatchError(this, error);
+            throw error;
+          },
         );
-      }, (error) => warnOnce("batch-fetch", "The batch request failed.", { error: String(error) }));
-      return responsePromise;
-    };
+      };
+    }
+    if (typeof Response.prototype.text === "function") {
+      const originalResponseText = Response.prototype.text;
+      Response.prototype.text = function observedBatchResponseText(...args) {
+        const textPromise = Reflect.apply(originalResponseText, this, args);
+        if (!isBatchResponse(this)) return textPromise;
+        return textPromise.then(
+          (text) => {
+            try {
+              observeBatchPayload(this, JSON.parse(text), "text");
+            } catch (error) {
+              observeBatchError(this, error);
+            }
+            return text;
+          },
+          (error) => {
+            observeBatchError(this, error);
+            throw error;
+          },
+        );
+      };
+    }
   };
 
   const getFiber = (element) => Object.getOwnPropertyNames(element)
@@ -1032,7 +1073,7 @@
       graphFor,
       graphSummary,
       hydrateGraph,
-      isBatchRequest,
+      isBatchResponse,
       mergeMappings,
       mutationMatters,
       readContext,
