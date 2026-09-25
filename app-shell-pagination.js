@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.6.0 Beta 16";
+  const VERSION = "0.6.0 Beta 17";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
@@ -103,6 +103,8 @@
         : null;
       const parts = Array.isArray(node.message?.content?.parts) ? node.message.content.parts : [];
       const hidden = node.message?.metadata?.is_visually_hidden_from_conversation === true;
+      const recipient = typeof node.message?.recipient === "string" ? node.message.recipient : null;
+      const channel = typeof node.message?.channel === "string" ? node.message.channel : null;
       compact[id] = {
         parent: typeof node.parent === "string" ? node.parent : null,
         children: Array.isArray(node.children)
@@ -113,6 +115,8 @@
         visibleRole: !hidden && role === "user"
           ? "user"
           : !hidden && role === "assistant" &&
+            (recipient === null || recipient === "all") &&
+            (channel === null || channel === "final") &&
             (contentType === null || contentType === "text" || contentType === "multimodal_text") &&
             parts.some((part) =>
             typeof part === "string" ? part.length > 0 : part != null)
@@ -292,7 +296,17 @@
   const storeGraph = (graph) => {
     graphs.delete(graph.conversationId);
     graphs.set(graph.conversationId, graph);
-    while (graphs.size > MAX_GRAPHS) graphs.delete(graphs.keys().next().value);
+    const protectedIds = new Set();
+    const pathMatch = location.pathname.match(/(?:^|\/)c\/([^/?#]+)/);
+    if (pathMatch) protectedIds.add(pathMatch[1]);
+    for (const controls of document.querySelectorAll(CONTROLS)) {
+      if (controls.dataset.conversationId) protectedIds.add(controls.dataset.conversationId);
+    }
+    while (graphs.size > MAX_GRAPHS) {
+      const victim = [...graphs.keys()].find((conversationId) => !protectedIds.has(conversationId));
+      if (!victim) break;
+      graphs.delete(victim);
+    }
   };
 
   const captureBatch = (payload, url) => {
@@ -374,6 +388,38 @@
   const getFiber = (element) => Object.getOwnPropertyNames(element)
     .find((name) => name.startsWith("__reactFiber$") || name.startsWith("__reactInternalInstance$"));
 
+  const currentFiber = (fiber) => {
+    const alternate = fiber?.alternate;
+    if (!alternate) return fiber;
+    let left = fiber;
+    let right = alternate;
+    for (let depth = 0; left && right && depth < 100; depth++) {
+      const leftParent = left.return;
+      const rightParent = right.return;
+      if (!leftParent || !rightParent) break;
+      if (leftParent === rightParent || leftParent.child === rightParent.child) {
+        for (let child = leftParent.child; child; child = child.sibling) {
+          if (child === left) return fiber;
+          if (child === right) return alternate;
+        }
+      }
+      if (leftParent !== rightParent &&
+          leftParent.alternate !== rightParent && rightParent.alternate !== leftParent) break;
+      left = leftParent;
+      right = rightParent;
+    }
+    const rootOf = (candidate) => {
+      let root = candidate;
+      for (let depth = 0; root?.return && depth < 200; depth++) root = root.return;
+      return root;
+    };
+    const leftRoot = rootOf(fiber);
+    const rightRoot = rootOf(alternate);
+    const activeRoot = leftRoot?.stateNode?.current ?? rightRoot?.stateNode?.current;
+    if (leftRoot !== rightRoot && activeRoot === rightRoot) return alternate;
+    return fiber;
+  };
+
   const isScope = (value) => value && typeof value === "object" &&
     value.scope?.__scopeBrand === "AppScope" && typeof value.get === "function";
 
@@ -388,39 +434,29 @@
   const readContext = (bubble) => {
     diagnostics.contextScans++;
     const key = getFiber(bubble);
-    let fiber = key ? bubble[key] : null;
+    let fiber = currentFiber(key ? bubble[key] : null);
     let scope = null;
-    const candidates = [];
+    let context = null;
     for (let depth = 0; fiber && depth < 100; depth++, fiber = fiber.return) {
-      for (const current of [fiber, fiber.alternate]) {
-        if (!current) continue;
-        scope ??= scopeInHooks(current.memoizedState);
-        const props = current.memoizedProps;
-        if (!props || typeof props !== "object") continue;
-        if (props.item?.type === "user-message" && typeof props.item.messageId === "string" &&
-            typeof props.conversationId === "string") {
-          candidates.push({ conversationId: props.conversationId, messageId: props.item.messageId });
-        }
+      scope ??= scopeInHooks(fiber.memoizedState);
+      const props = fiber.memoizedProps;
+      if (!context && props && typeof props === "object" &&
+          props.item?.type === "user-message" && typeof props.item.messageId === "string" &&
+          typeof props.conversationId === "string") {
+        context = { conversationId: props.conversationId, messageId: props.item.messageId };
       }
     }
-    if (!scope || !candidates.length) return null;
-    const unique = [...new Map(candidates.map((item) => [`${item.conversationId}:${item.messageId}`, item])).values()];
-    const matching = unique.find((item) => graphs.get(item.conversationId)?.mapping[item.messageId]) ??
-      unique.find((item) => [...graphs.values()].some((graph) => graph.mapping[item.messageId]));
-    return matching ? { ...matching, scope } : { ...unique[0], scope };
+    return scope && context ? { ...context, scope } : null;
   };
-
-  const graphFor = (context) => graphs.get(context.conversationId) ??
-    [...graphs.values()].find((graph) => graph.mapping[context.messageId]) ?? null;
 
   const mappingScore = (value, graph, messageId) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return -1;
-    if (!value[messageId] && !(graph.currentNode && value[graph.currentNode])) return -1;
+    if (!value[messageId] && !(graph?.currentNode && value[graph.currentNode])) return -1;
     const nodes = Object.values(value);
     if (!nodes.some((node) => node && typeof node === "object" &&
         Array.isArray(node.children) && "parent" in node && "message" in node)) return -1;
     let knownNodes = 0;
-    for (const id of Object.keys(graph.mapping)) if (value[id]) knownNodes++;
+    for (const id of Object.keys(graph?.mapping ?? {})) if (value[id]) knownNodes++;
     return knownNodes * 100 + Math.min(nodes.length, 99);
   };
 
@@ -469,6 +505,40 @@
       mappingScore: best.score,
     });
     return adapter;
+  };
+
+  const restoreGraphFromScope = (context) => {
+    const adapter = discoverScopeAdapter(context, null);
+    if (!adapter) return null;
+    let liveMapping;
+    try {
+      liveMapping = context.scope.get(adapter.mappingSignal, context.conversationId);
+    } catch {
+      return null;
+    }
+    const graph = compactGraph({
+      id: context.conversationId,
+      current_node: context.messageId,
+      mapping: liveMapping,
+    });
+    if (!graph) return null;
+    storeGraph(graph);
+    adapter.lastApplied = liveMapping;
+    adapter.lastRevision = graph.revision;
+    record("graph-restored-from-scope", {
+      conversationId: context.conversationId,
+      mappingCount: Object.keys(graph.mapping).length,
+    });
+    return graph;
+  };
+
+  const graphFor = (context) => {
+    const graph = graphs.get(context.conversationId) ??
+      [...graphs.values()].find((candidate) => candidate.mapping[context.messageId]);
+    if (!graph) return restoreGraphFromScope(context);
+    graphs.delete(graph.conversationId);
+    graphs.set(graph.conversationId, graph);
+    return graph;
   };
 
   const hydrateGraph = (context, graph) => {
@@ -1064,6 +1134,7 @@
       assistantVariants,
       captureBatch,
       compactGraph,
+      currentFiber,
       graphFor,
       graphSummary,
       hydrateGraph,
