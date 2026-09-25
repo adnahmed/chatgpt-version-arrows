@@ -47,3 +47,9 @@
 [data-batch-pagination-suppressed] {
   display: none !important;
 }
+
+html[data-codex-window-type] .turn-action-controls button[aria-label="See versions"],
+html[data-codex-window-type] .turn-action-controls button[aria-label="Посмотреть версии"],
+html[data-codex-window-type] .turn-action-controls button[aria-label="Просмотреть версии"] {
+  display: none !important;
+}

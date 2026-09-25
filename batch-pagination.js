@@ -1,12 +1,17 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.8.0-batch-test.12";
+  const VERSION = "0.8.0-batch-test.13";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
   const CONTROLS = "[data-batch-edit-pagination]";
   const ASSISTANT_CONTROLS = "[data-batch-assistant-pagination]";
+  const NATIVE_VERSIONS_BUTTON = [
+    'button[aria-label="See versions"]',
+    'button[aria-label="Посмотреть версии"]',
+    'button[aria-label="Просмотреть версии"]',
+  ].join(", ");
   const BATCH_PATH = "/backend-api/conversations/batch";
   const RUNTIME_HINT = /^\/cdn\/assets\/633146\.[a-z0-9]+\.js$/;
   const MAX_GRAPHS = 3;
@@ -615,11 +620,11 @@
     return true;
   };
 
-  const suppressNativeVersions = (mountInfo) => {
-    for (const button of mountInfo.row.querySelectorAll('button[aria-label="See versions"]')) {
+  const suppressNativeVersions = (root, details = {}) => {
+    for (const button of root.querySelectorAll(NATIVE_VERSIONS_BUTTON)) {
       if (!button.hasAttribute("data-batch-pagination-suppressed")) {
         button.setAttribute("data-batch-pagination-suppressed", "");
-        record("native-versions-suppressed");
+        record("native-versions-suppressed", details);
       }
     }
   };
@@ -654,6 +659,24 @@
     return null;
   };
 
+  const assistantPaginationMount = (row) => {
+    const more = row.querySelector('button[aria-label="More actions"], button[aria-label="Ещё действия"]');
+    if (!more) return { mount: row, insertionPoint: null };
+    let rowChild = more;
+    while (rowChild.parentElement && rowChild.parentElement !== row) rowChild = rowChild.parentElement;
+    if (rowChild.parentElement !== row) return { mount: row, insertionPoint: null };
+    if (rowChild === more) return { mount: row, insertionPoint: more };
+    const mount = rowChild;
+    let insertionPoint = more;
+    while (insertionPoint.parentElement && insertionPoint.parentElement !== mount) {
+      insertionPoint = insertionPoint.parentElement;
+    }
+    return {
+      mount,
+      insertionPoint: insertionPoint.parentElement === mount ? insertionPoint : null,
+    };
+  };
+
   const contextForConversation = (conversationId) => {
     for (const bubble of document.querySelectorAll(USER_BUBBLE)) {
       const context = readContext(bubble);
@@ -677,12 +700,7 @@
   const paintAssistantPagination = (message, context, graph, row, currentPass) => {
     const messageId = message.getAttribute("data-chatgpt-selection-message-id");
     if (!messageId) return false;
-    for (const button of row.querySelectorAll('button[aria-label="See versions"]')) {
-      if (!button.hasAttribute("data-batch-pagination-suppressed")) {
-        button.setAttribute("data-batch-pagination-suppressed", "");
-        record("native-versions-suppressed", { role: "assistant", messageId });
-      }
-    }
+    suppressNativeVersions(row, { role: "assistant", messageId });
     const ids = assistantVariants(graph, messageId);
     const index = ids.indexOf(messageId);
     const native = nativeAssistantPaginationFor(row);
@@ -728,11 +746,9 @@
     controls.dataset.pass = String(currentPass);
     controls.dataset.conversationId = context.conversationId;
     controls.dataset.messageId = messageId;
-    const more = row.querySelector('button[aria-label="More actions"], button[aria-label="Ещё действия"]');
-    let insertionPoint = more;
-    while (insertionPoint && insertionPoint.parentElement !== row) insertionPoint = insertionPoint.parentElement;
-    if (controls.parentElement !== row || (insertionPoint && controls.nextElementSibling !== insertionPoint)) {
-      row.insertBefore(controls, insertionPoint);
+    const { mount, insertionPoint } = assistantPaginationMount(row);
+    if (controls.parentElement !== mount || (insertionPoint && controls.nextElementSibling !== insertionPoint)) {
+      mount.insertBefore(controls, insertionPoint);
     }
     const [previous, counter, next] = controls.children;
     const caption = `${index + 1}/${ids.length}`;
@@ -887,7 +903,7 @@
     for (const bubble of bubbles) {
       const mountInfo = findMount(bubble);
       if (!mountInfo) continue;
-      suppressNativeVersions(mountInfo);
+      suppressNativeVersions(mountInfo.row, { role: "user" });
       const context = readContext(bubble);
       if (!context) continue;
       contexts.set(context.conversationId, context);
