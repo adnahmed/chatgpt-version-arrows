@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Edit Pagination Patch",
-  "version": "0.5.3",
-  "description": "Restores ChatGPT edited-message version controls.",
+  "name": "ChatGPT Version Arrows",
+  "version": "0.6.0",
+  "version_name": "0.6.0",
+  "description": "Restores previous/next version arrows for edited messages and regenerated responses.",
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["patch.js"],
+      "js": ["patch.js", "app-shell-pagination.js"],
+      "css": ["app-shell-pagination.css"],
       "run_at": "document_start",
       "world": "MAIN"
     }
