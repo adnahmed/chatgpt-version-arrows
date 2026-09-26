@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.6.0 Beta 17";
+  const VERSION = "0.6.0 Beta 18";
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
@@ -248,7 +248,7 @@
     return merged;
   };
 
-  const compactGraph = (payload) => {
+  const createGraphState = (payload) => {
     if (!payload || typeof payload !== "object" || !payload.mapping || typeof payload.mapping !== "object") {
       return null;
     }
@@ -314,7 +314,7 @@
     const captured = [];
     latestBatchPayload = payload;
     for (const conversation of conversations) {
-      const graph = compactGraph(conversation);
+      const graph = createGraphState(conversation);
       if (!graph) continue;
       storeGraph(graph);
       captured.push(graphSummary(graph));
@@ -516,7 +516,7 @@
     } catch {
       return null;
     }
-    const graph = compactGraph({
+    const graph = createGraphState({
       id: context.conversationId,
       current_node: context.messageId,
       mapping: liveMapping,
@@ -574,8 +574,6 @@
       return false;
     }
   };
-
-  const variants = (graph, messageId) => userVariants(graph, messageId);
 
   const findMount = (bubble) => {
     let element = bubble.parentElement;
@@ -671,15 +669,15 @@
     if (!context || pendingConversations.has(context.conversationId)) return;
     const graph = graphFor(context);
     if (!graph || !hydrateGraph(context, graph)) return;
-    const ids = variants(graph, context.messageId);
+    const ids = userVariants(graph, context.messageId);
     const index = ids.indexOf(context.messageId);
     const target = index < 0 ? null : ids[index + direction];
     if (!target) return;
     await requestSwitch(context, context.messageId, target, labels().failed);
   };
 
-  const paint = (bubble, context, graph, mountInfo, currentPass) => {
-    const ids = variants(graph, context.messageId);
+  const paintUserPagination = (bubble, context, graph, mountInfo, currentPass) => {
+    const ids = userVariants(graph, context.messageId);
     const index = ids.indexOf(context.messageId);
     const { mount } = mountInfo;
     let controls = mount.querySelector(CONTROLS);
@@ -1015,7 +1013,7 @@
       const graph = graphFor(context);
       if (!graph) continue;
       if (!hydrateGraph(context, graph)) continue;
-      if (paint(bubble, context, graph, mountInfo, currentPass)) painted++;
+      if (paintUserPagination(bubble, context, graph, mountInfo, currentPass)) painted++;
     }
     const assistantPainted = reconcileAssistantPagination(currentPass, contexts);
     for (const controls of document.querySelectorAll(CONTROLS)) {
@@ -1133,7 +1131,7 @@
       attachRuntime,
       assistantVariants,
       captureBatch,
-      compactGraph,
+      createGraphState,
       currentFiber,
       graphFor,
       graphSummary,
@@ -1144,7 +1142,7 @@
       readContext,
       runtimeUrls,
       scanSwitcher,
-      variants,
+      userVariants,
     };
   }
 })();
