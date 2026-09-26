@@ -1,7 +1,12 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.6.0 Beta 18";
+  const VERSION = "0.6.0 Beta 19";
+  // Development diagnostics are disabled in release builds. Set DEBUG to true
+  // locally when a live AppShell investigation needs an in-memory event log.
+  const DEBUG = false;
+  const TEST_MODE = globalThis.__CHATGPT_EDIT_PAGINATION_PATCH_TEST__ === true;
+  const DIAGNOSTICS_ENABLED = DEBUG || TEST_MODE;
   const SHELL_ATTRIBUTE = "data-codex-window-type";
   const USER_BUBBLE = "[data-user-message-bubble]";
   const ASSISTANT_MESSAGE = "[data-chatgpt-selection-message-id]";
@@ -23,7 +28,7 @@
   const observedBatchResponses = new WeakSet();
   const attemptedRuntimeUrls = new Set();
   const warned = new Set();
-  const diagnostics = {
+  const diagnostics = DIAGNOSTICS_ENABLED ? {
     version: VERSION,
     installedAt: new Date().toISOString(),
     batchResponses: 0,
@@ -37,9 +42,9 @@
     runtimeImportFailures: 0,
     switcherScans: 0,
     switcher: null,
+    graphSummaries: 0,
     events: [],
-  };
-  let latestBatchPayload = null;
+  } : null;
   let runtime = null;
   let switcher = null;
   let runtimeDiscovery = null;
@@ -51,6 +56,7 @@
   let graphRevision = 0;
 
   const record = (type, details = {}) => {
+    if (!diagnostics) return;
     diagnostics.events.push({ at: new Date().toISOString(), type, ...details });
     if (diagnostics.events.length > MAX_EVENTS) diagnostics.events.splice(0, diagnostics.events.length - MAX_EVENTS);
   };
@@ -266,6 +272,7 @@
   };
 
   const graphSummary = (graph) => {
+    if (diagnostics) diagnostics.graphSummaries++;
     const userGroups = new Set();
     const assistantGroups = new Set();
     let maxUserVariants = 0;
@@ -311,26 +318,31 @@
 
   const captureBatch = (payload, url) => {
     const conversations = Array.isArray(payload) ? payload : [];
-    const captured = [];
-    latestBatchPayload = payload;
+    const captured = diagnostics ? [] : null;
+    let capturedCount = 0;
     for (const conversation of conversations) {
       const graph = createGraphState(conversation);
       if (!graph) continue;
       storeGraph(graph);
-      captured.push(graphSummary(graph));
+      capturedCount++;
+      captured?.push({ conversationId: graph.conversationId, currentNode: graph.currentNode });
     }
-    diagnostics.batchCaptures++;
-    record("batch-captured", { url, conversationCount: conversations.length, graphs: captured });
-    if (!captured.length) warnOnce("batch-shape", "The batch response did not contain a usable conversation graph.");
+    if (diagnostics) {
+      diagnostics.batchCaptures++;
+      record("batch-captured", { url, conversationCount: conversations.length, graphs: captured });
+    }
+    if (!capturedCount) warnOnce("batch-shape", "The batch response did not contain a usable conversation graph.");
     schedule();
-    return captured.length;
+    return capturedCount;
   };
 
   const observeBatchPayload = (responseKey, payload, source, url) => {
     if (observedBatchResponses.has(responseKey)) return;
     observedBatchResponses.add(responseKey);
-    diagnostics.batchResponses++;
-    record("batch-response", { url, source });
+    if (diagnostics) {
+      diagnostics.batchResponses++;
+      record("batch-response", { url, source });
+    }
     captureBatch(payload, url);
   };
 
@@ -432,7 +444,7 @@
   };
 
   const readContext = (bubble) => {
-    diagnostics.contextScans++;
+    if (diagnostics) diagnostics.contextScans++;
     const key = getFiber(bubble);
     let fiber = currentFiber(key ? bubble[key] : null);
     let scope = null;
@@ -481,7 +493,7 @@
         cache.delete(context.conversationId);
       }
     }
-    diagnostics.scopeScans++;
+    if (diagnostics) diagnostics.scopeScans++;
     let best = null;
     const families = context.scope.node?.familyBindings;
     if (!families || typeof families.keys !== "function") return null;
@@ -500,10 +512,12 @@
     if (!best) return null;
     const adapter = { mappingSignal: best.mappingSignal, lastApplied: null, lastRevision: 0 };
     cache.set(context.conversationId, adapter);
-    record("scope-adapter-found", {
-      conversationId: context.conversationId,
-      mappingScore: best.score,
-    });
+    if (diagnostics) {
+      record("scope-adapter-found", {
+        conversationId: context.conversationId,
+        mappingScore: best.score,
+      });
+    }
     return adapter;
   };
 
@@ -525,10 +539,12 @@
     storeGraph(graph);
     adapter.lastApplied = liveMapping;
     adapter.lastRevision = graph.revision;
-    record("graph-restored-from-scope", {
-      conversationId: context.conversationId,
-      mappingCount: Object.keys(graph.mapping).length,
-    });
+    if (diagnostics) {
+      record("graph-restored-from-scope", {
+        conversationId: context.conversationId,
+        mappingCount: Object.keys(graph.mapping).length,
+      });
+    }
     return graph;
   };
 
@@ -548,8 +564,10 @@
     try {
       liveMapping = context.scope.get(adapter.mappingSignal, context.conversationId);
     } catch (error) {
-      diagnostics.scopeHydrationFailures++;
-      record("scope-hydration-failed", { conversationId: context.conversationId, error: String(error) });
+      if (diagnostics) {
+        diagnostics.scopeHydrationFailures++;
+        record("scope-hydration-failed", { conversationId: context.conversationId, error: String(error) });
+      }
       return false;
     }
     if (liveMapping === adapter.lastApplied && adapter.lastRevision === graph.revision) return true;
@@ -560,17 +578,21 @@
       context.scope.set(adapter.mappingSignal, context.conversationId, merged);
       adapter.lastApplied = merged;
       adapter.lastRevision = graph.revision;
-      diagnostics.scopeHydrations++;
-      record("scope-hydrated", {
-        conversationId: context.conversationId,
-        batchMappingCount: Object.keys(graph.batchMapping).length,
-        liveMappingCount: Object.keys(liveMapping ?? {}).length,
-        mergedMappingCount: Object.keys(merged).length,
-      });
+      if (diagnostics) {
+        diagnostics.scopeHydrations++;
+        record("scope-hydrated", {
+          conversationId: context.conversationId,
+          batchMappingCount: Object.keys(graph.batchMapping).length,
+          liveMappingCount: Object.keys(liveMapping ?? {}).length,
+          mergedMappingCount: Object.keys(merged).length,
+        });
+      }
       return true;
     } catch (error) {
-      diagnostics.scopeHydrationFailures++;
-      record("scope-hydration-failed", { conversationId: context.conversationId, error: String(error) });
+      if (diagnostics) {
+        diagnostics.scopeHydrationFailures++;
+        record("scope-hydration-failed", { conversationId: context.conversationId, error: String(error) });
+      }
       return false;
     }
   };
@@ -645,18 +667,20 @@
     }
     pendingConversations.add(context.conversationId);
     conversationErrors.delete(context.conversationId);
-    record("switch-requested", {
-      conversationId: context.conversationId,
-      currentMessageId,
-      targetMessageId,
-    });
+    if (diagnostics) {
+      record("switch-requested", {
+        conversationId: context.conversationId,
+        currentMessageId,
+        targetMessageId,
+      });
+    }
     schedule();
     try {
       await switcher(context.scope, context.conversationId, targetMessageId);
-      record("switch-completed", { conversationId: context.conversationId, targetMessageId });
+      if (diagnostics) record("switch-completed", { conversationId: context.conversationId, targetMessageId });
     } catch (error) {
       conversationErrors.set(context.conversationId, failureMessage);
-      record("switch-failed", { conversationId: context.conversationId, targetMessageId, error: String(error) });
+      if (diagnostics) record("switch-failed", { conversationId: context.conversationId, targetMessageId, error: String(error) });
       warnOnce("switch-failed", failureMessage, { error: String(error) });
     } finally {
       pendingConversations.delete(context.conversationId);
@@ -727,7 +751,7 @@
     for (const button of root.querySelectorAll(NATIVE_VERSIONS_BUTTON)) {
       if (!button.hasAttribute("data-batch-pagination-suppressed")) {
         button.setAttribute("data-batch-pagination-suppressed", "");
-        record("native-versions-suppressed", details);
+        if (diagnostics) record("native-versions-suppressed", details);
       }
     }
   };
@@ -812,10 +836,10 @@
       const phantom = ids.length < 2;
       if (phantom && !native.hasAttribute("data-batch-pagination-suppressed")) {
         native.setAttribute("data-batch-pagination-suppressed", "");
-        record("phantom-assistant-pagination-suppressed", { messageId });
+        if (diagnostics) record("phantom-assistant-pagination-suppressed", { messageId });
       } else if (!phantom && native.hasAttribute("data-batch-pagination-suppressed")) {
         native.removeAttribute("data-batch-pagination-suppressed");
-        record("assistant-pagination-restored", { messageId });
+        if (diagnostics) record("assistant-pagination-restored", { messageId });
       }
       controls?.remove();
       return false;
@@ -892,7 +916,7 @@
 
   const scanSwitcher = () => {
     if (switcher || !runtime?.c) return switcher;
-    diagnostics.switcherScans++;
+    if (diagnostics) diagnostics.switcherScans++;
     const hits = [];
     for (const [moduleId, module] of Object.entries(runtime.c)) {
       const exports = module?.exports;
@@ -919,8 +943,11 @@
     }
     if (hits.length === 1) {
       switcher = hits[0].candidate;
-      diagnostics.switcher = { moduleId: hits[0].moduleId, exportName: hits[0].exportName };
-      record("switcher-found", diagnostics.switcher);
+      const switcherDetails = { moduleId: hits[0].moduleId, exportName: hits[0].exportName };
+      if (diagnostics) {
+        diagnostics.switcher = switcherDetails;
+        record("switcher-found", switcherDetails);
+      }
       schedule();
     } else if (hits.length > 1) {
       warnOnce("switcher-ambiguous", "More than one native branch switcher matched the required behavior.", {
@@ -933,7 +960,7 @@
   const attachRuntime = (candidate) => {
     if (runtime || !candidate?.c || !candidate?.m) return false;
     runtime = candidate;
-    record("runtime-found", { cacheSize: Object.keys(runtime.c).length });
+    if (diagnostics) record("runtime-found", { cacheSize: Object.keys(runtime.c).length });
     scanSwitcher();
     return true;
   };
@@ -968,20 +995,22 @@
     if (runtimeDiscovery) return runtimeDiscovery;
     runtimeDiscovery = (async () => {
       const urls = runtimeUrls();
-      record("runtime-candidates", { count: urls.length, urls: urls.map((url) => url.pathname) });
+      if (diagnostics) record("runtime-candidates", { count: urls.length, urls: urls.map((url) => url.pathname) });
       for (const url of urls) {
         if (attemptedRuntimeUrls.has(url.href)) continue;
         attemptedRuntimeUrls.add(url.href);
-        diagnostics.runtimeImports++;
+        if (diagnostics) diagnostics.runtimeImports++;
         try {
           const module = await import(url.href);
           if (attachRuntime(module.__webpack_require__)) {
-            record("runtime-imported", { url: url.pathname });
+            if (diagnostics) record("runtime-imported", { url: url.pathname });
             break;
           }
         } catch (error) {
-          diagnostics.runtimeImportFailures++;
-          record("runtime-import-failed", { url: url.href, error: String(error) });
+          if (diagnostics) {
+            diagnostics.runtimeImportFailures++;
+            record("runtime-import-failed", { url: url.href, error: String(error) });
+          }
         }
       }
       return runtime;
@@ -994,7 +1023,7 @@
   const reconcile = () => {
     frame = null;
     if (stopped) return;
-    diagnostics.renders++;
+    if (diagnostics) diagnostics.renders++;
     const currentPass = ++pass;
     if (!isShell()) {
       for (const controls of document.querySelectorAll(CONTROLS)) controls.remove();
@@ -1019,7 +1048,7 @@
     for (const controls of document.querySelectorAll(CONTROLS)) {
       if (controls.dataset.pass !== String(currentPass)) controls.remove();
     }
-    record("render", { bubbleCount: bubbles.length, painted, assistantPainted, graphCount: graphs.size });
+    if (diagnostics) record("render", { bubbleCount: bubbles.length, painted, assistantPainted, graphCount: graphs.size });
     if (bubbles.length && graphs.size && !runtime) void discoverRuntime();
     else if (runtime && !switcher) scanSwitcher();
   };
@@ -1054,34 +1083,37 @@
     schedule();
   };
 
-  const debugSnapshot = () => ({
-    version: VERSION,
-    capturedAt: new Date().toISOString(),
-    location: { origin: location.origin, pathname: location.pathname },
-    document: {
-      build: document.documentElement?.getAttribute("data-build") ?? null,
-      shell: isShell(),
-      lang: document.documentElement?.lang ?? "",
-      readyState: document.readyState,
-    },
-    diagnostics: {
-      ...diagnostics,
-      events: diagnostics.events.slice(),
-    },
-    graphs: [...graphs.values()].map((graph) => ({
+  const debugSnapshot = () => {
+    if (!diagnostics) return null;
+    const graphSnapshots = [...graphs.values()].map((graph) => ({
       conversationId: graph.conversationId,
       currentNode: graph.currentNode,
       revision: graph.revision,
       mapping: graph.mapping,
       summary: graphSummary(graph),
-    })),
-    latestBatchPayload,
-    controls: [...document.querySelectorAll(CONTROLS)].map((controls) => ({
-      conversationId: controls.dataset.conversationId ?? null,
-      messageId: controls.dataset.messageId ?? null,
-      caption: controls.textContent,
-    })),
-  });
+    }));
+    return {
+      version: VERSION,
+      capturedAt: new Date().toISOString(),
+      location: { origin: location.origin, pathname: location.pathname },
+      document: {
+        build: document.documentElement?.getAttribute("data-build") ?? null,
+        shell: isShell(),
+        lang: document.documentElement?.lang ?? "",
+        readyState: document.readyState,
+      },
+      diagnostics: {
+        ...diagnostics,
+        events: diagnostics.events.slice(),
+      },
+      graphs: graphSnapshots,
+      controls: [...document.querySelectorAll(CONTROLS)].map((controls) => ({
+        conversationId: controls.dataset.conversationId ?? null,
+        messageId: controls.dataset.messageId ?? null,
+        caption: controls.textContent,
+      })),
+    };
+  };
 
   const downloadDebugSnapshot = () => {
     const blob = new Blob([JSON.stringify(debugSnapshot(), null, 2)], { type: "application/json" });
@@ -1120,13 +1152,15 @@
     rootObserver?.disconnect();
   }, { once: true });
 
-  globalThis.__chatgptBatchPagination = {
-    version: VERSION,
-    getDebugSnapshot: debugSnapshot,
-    downloadDebugSnapshot,
-  };
+  if (DIAGNOSTICS_ENABLED) {
+    globalThis.__chatgptBatchPagination = {
+      version: VERSION,
+      getDebugSnapshot: debugSnapshot,
+      downloadDebugSnapshot,
+    };
+  }
 
-  if (globalThis.__CHATGPT_EDIT_PAGINATION_PATCH_TEST__ === true) {
+  if (TEST_MODE) {
     globalThis.__chatgptBatchPaginationTest = {
       attachRuntime,
       assistantVariants,
@@ -1135,6 +1169,7 @@
       currentFiber,
       graphFor,
       graphSummary,
+      getGraphSummaryRuns: () => diagnostics.graphSummaries,
       hydrateGraph,
       isBatchResponse,
       mergeMappings,

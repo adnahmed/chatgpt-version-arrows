@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ChatGPT Edit Pagination Patch",
   "version": "0.6.0",
-  "version_name": "0.6.0 Beta 18",
+  "version_name": "0.6.0 Beta 19",
   "description": "Restores ChatGPT edited-message version controls.",
   "content_scripts": [
     {
