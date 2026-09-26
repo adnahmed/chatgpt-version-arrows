@@ -1,4 +1,4 @@
-# ChatGPT Edit Pagination Patch
+# ChatGPT Version Arrows
 
 Restores the previous/next version arrows for edited messages and regenerated responses, so you can switch between versions directly in the conversation. Works with both ChatGPT's classic web client and the newer AppShell client.
 
@@ -16,13 +16,13 @@ Restores the previous/next version arrows for edited messages and regenerated re
 2. Click **Download ZIP**.
 3. When the download finishes, open your Downloads folder.
 4. Right-click the downloaded ZIP file and select **Extract All**.
-5. Move the extracted `chatgpt-edit-pagination-patch-main` folder to a permanent location where you will not delete or move it later.
+5. Move the extracted `chatgpt-version-arrows-main` folder to a permanent location where you will not delete or move it later.
 6. Open the extracted folder and make sure it contains `manifest.json`, `patch.js`, `app-shell-pagination.js`, and `app-shell-pagination.css`.
 7. Open Chrome and enter `chrome://extensions` in the address bar.
 8. Enable **Developer mode** in the top-right corner.
 9. Click **Load unpacked**.
 10. Select the extracted folder that directly contains `manifest.json`. Do not select the ZIP file, the `assets` folder, or a parent folder.
-11. Make sure **ChatGPT Edit Pagination Patch** appears on the Extensions page and is enabled.
+11. Make sure the extension appears on the Extensions page and is enabled.
 12. Reload every open ChatGPT tab with `Ctrl+Shift+R`.
 
 > Keep the extracted folder after installation. Chrome loads the extension directly from that location. If you delete, rename, or move the folder, the extension may stop working and will need to be loaded again.
@@ -50,13 +50,13 @@ POST /backend-api/conversations/batch
 
 The response already contains the branch graph needed to identify edited user messages and regenerated assistant responses. The AppShell adapter combines that graph with ChatGPT's live AppScope state, adds compact previous/next controls to the existing action rows, and uses ChatGPT's native branch switcher to change the active version.
 
-When AppShell already renders valid native response pagination, the extension leaves it in place. It supplies matching controls when the native controls are missing and removes phantom pagination when the visible graph contains only one real response.
+When AppShell already renders valid native response arrows, the extension leaves them in place. It supplies matching arrows when the native controls are missing and removes false version controls when the visible graph contains only one real response.
 
 ### Classic client
 
-The classic client uses ChatGPT's original pagination components. The extension restores them by normalizing the relevant bootstrap configuration before the frontend reads it.
+The classic client uses ChatGPT's original version-arrow components. The extension restores them by normalizing the relevant bootstrap configuration before the frontend reads it.
 
-#### Paginated-messages rollout
+#### Message-version loading rollout
 
 An observed classic-client rollout is controlled by this bootstrap layer:
 
@@ -107,7 +107,7 @@ If `num_turns` appears in `explicit_parameters`, only that entry is removed. Oth
 
 ### Edit-version experiments
 
-The shared config patch looks for ChatGPT bootstrap/config objects with this edit-pagination value shape:
+The shared config patch looks for ChatGPT bootstrap/config objects with this edited-message control shape:
 
 ```js
 {
@@ -122,12 +122,12 @@ The shared config patch looks for ChatGPT bootstrap/config objects with this edi
 Observed fields:
 
 - `variant_modal`: opens older edited-message versions in a modal with a **Branch in new chat** action.
-- `hide_pagination`: older experiment flag. When `true`, ChatGPT hides the usual edited-message version pagination controls.
+- `hide_pagination`: older experiment flag. When `true`, ChatGPT hides the usual previous/next version arrows for edited messages.
 - `edit_actions_treatment`: older experiment treatment string. Observed affected values were `"warning"` and `"branch_prefill"`.
 - `edit_buttons_hidden`: edit-control visibility flag. The default value is `false`.
 - `edit_warning`: edit-warning mode. The default value is `"none"`.
 
-When that shape is found, the value is normalized to the original pagination behavior:
+When that shape is found, the value is normalized to the original version-arrow behavior:
 
 ```js
 {
@@ -146,19 +146,19 @@ group_name: "Control"
 is_user_in_experiment: false
 ```
 
-Edit-pagination entries are removed from `explicit_parameters`; unrelated entries are preserved.
+These edited-message entries are removed from `explicit_parameters`; unrelated entries are preserved.
 
 Observed affected experiments:
 
 | Experiment id | Group | Explicit parameters | Observed behavior |
 | --- | --- | --- | --- |
 | `1973873291` | `Test` | `variant_modal` | Shows edited-message versions through the branch modal. |
-| `3879630193` | `Warning` | `hide_pagination`, `edit_actions_treatment` | Hides edited-message pagination and applies the warning treatment. |
-| `3879348497` | `Branch Prefill` | `hide_pagination`, `edit_actions_treatment` | Hides edited-message pagination and applies the branch-prefill treatment. |
+| `3879630193` | `Warning` | `hide_pagination`, `edit_actions_treatment` | Hides the edited-message version arrows and applies the warning treatment. |
+| `3879348497` | `Branch Prefill` | `hide_pagination`, `edit_actions_treatment` | Hides the edited-message version arrows and applies the branch-prefill treatment. |
 
 Known experiment ids are used only as secondary markers.
 
-For these experiment configs, the primary match is the edit-pagination field shape, not a user id or account-specific id. The classic conversation-loading rollout is matched separately by the exact `2605344799` layer id and its numeric `num_turns` value.
+For these experiment configs, the primary match is the edited-message field shape, not a user id or account-specific id. The classic conversation-loading rollout is matched separately by the exact `2605344799` layer id and its numeric `num_turns` value.
 
 ## How It Works
 
@@ -177,7 +177,7 @@ Both JavaScript content scripts run in the page's `MAIN` world.
 - `JSON.parse`
 - `Response.prototype.json`
 
-`JSON.parse` only walks parsed objects when the original JSON text contains edit-pagination markers or the exact `2605344799` conversation-loading layer id.
+`JSON.parse` only walks parsed objects when the original JSON text contains edited-message control markers or the exact `2605344799` conversation-loading layer id.
 
 `Response.prototype.json` only patches parsed values from config-like responses whose URL contains one of:
 
@@ -189,7 +189,7 @@ bootstrap
 
 For other backend responses, it returns the original parsed result without patching it.
 
-After the matching config is normalized, the classic frontend renders and operates its own native pagination controls.
+After the matching config is normalized, the classic frontend renders and operates its own native previous/next version arrows.
 
 ### AppShell adapter
 
@@ -205,5 +205,5 @@ The adapter uses ChatGPT's native branch-switching function.
 
 ### Classic client
 
-- Pagination for edited versions of the first user message is not restored in the classic client.
-- Classic support depends on the current bootstrap/statsig edit-pagination fields and the `2605344799` layer retaining their names and meanings.
+- Version arrows for edits of the first user message are not restored in the classic client.
+- Classic support depends on the current bootstrap/statsig edited-message fields and the `2605344799` layer retaining their names and meanings.

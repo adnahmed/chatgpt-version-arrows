@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Edit Pagination Patch",
+  "name": "ChatGPT Version Arrows",
   "version": "0.6.0",
-  "version_name": "0.6.0 Beta 19",
-  "description": "Restores ChatGPT edited-message version controls.",
+  "version_name": "0.6.0",
+  "description": "Restores previous/next version arrows for edited messages and regenerated responses.",
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
