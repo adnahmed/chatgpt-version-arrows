@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.6.0";
+  const VERSION = "0.6.1";
   // Development diagnostics are disabled in release builds. Set DEBUG to true
   // locally when a live AppShell investigation needs an in-memory event log.
   const DEBUG = false;
@@ -918,6 +918,7 @@
     if (switcher || !runtime?.c) return switcher;
     if (diagnostics) diagnostics.switcherScans++;
     const hits = [];
+    const seen = new Set();
     for (const [moduleId, module] of Object.entries(runtime.c)) {
       const exports = module?.exports;
       if (!exports || (typeof exports !== "object" && typeof exports !== "function")) continue;
@@ -937,6 +938,8 @@
         if (typeof candidate !== "function") continue;
         const source = candidateSource(candidate);
         if (source.includes("current_node_id") && source.includes("/conversation/{conversation_id}")) {
+          if (seen.has(candidate)) continue;
+          seen.add(candidate);
           hits.push({ moduleId, exportName, candidate });
         }
       }
