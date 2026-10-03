@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "0.6.1";
+  const VERSION = "0.6.2";
   // Development diagnostics are disabled in release builds. Set DEBUG to true
   // locally when a live AppShell investigation needs an in-memory event log.
   const DEBUG = false;
@@ -28,6 +28,8 @@
   const observedBatchResponses = new WeakSet();
   const attemptedRuntimeUrls = new Set();
   const warned = new Set();
+  const wrappedHistoryFactories = new WeakSet();
+  const historyLoaders = new WeakMap();
   const diagnostics = DIAGNOSTICS_ENABLED ? {
     version: VERSION,
     installedAt: new Date().toISOString(),
@@ -43,6 +45,7 @@
     switcherScans: 0,
     switcher: null,
     graphSummaries: 0,
+    fullHistoryLoads: 0,
     events: [],
   } : null;
   let runtime = null;
@@ -54,6 +57,7 @@
   let stopped = false;
   let pass = 0;
   let graphRevision = 0;
+  let historyRegistration = null;
 
   const record = (type, details = {}) => {
     if (!diagnostics) return;
@@ -219,7 +223,7 @@
     });
   };
 
-  const mergeMappings = (batchMapping, liveMapping) => {
+  const mergeMappings = (batchMapping, liveMapping, authoritative = true) => {
     const merged = cloneMapping(batchMapping);
     for (const [id, liveNode] of Object.entries(liveMapping ?? {})) {
       if (!liveNode || typeof liveNode !== "object") continue;
@@ -231,9 +235,9 @@
       merged[id] = {
         ...batchNode,
         ...liveNode,
-        // The paginated shell rewrites the first retained node to a synthetic
-        // root. The batch graph remains authoritative for nodes it already has.
-        parent: batchNode.parent,
+        // Only a full server graph can override the synthetic parent of a
+        // paginated slice. A cached slice must accept native prepend updates.
+        parent: authoritative ? batchNode.parent : liveNode.parent,
         children: [...new Set([...(batchNode.children ?? []), ...(liveNode.children ?? [])])],
       };
     }
@@ -254,7 +258,7 @@
     return merged;
   };
 
-  const createGraphState = (payload) => {
+  const createGraphState = (payload, authoritative = true) => {
     if (!payload || typeof payload !== "object" || !payload.mapping || typeof payload.mapping !== "object") {
       return null;
     }
@@ -264,6 +268,7 @@
     return {
       conversationId,
       currentNode: typeof payload.current_node === "string" ? payload.current_node : null,
+      authoritative,
       batchMapping,
       liveMapping: batchMapping,
       mapping: compactMapping(batchMapping),
@@ -534,7 +539,7 @@
       id: context.conversationId,
       current_node: context.messageId,
       mapping: liveMapping,
-    });
+    }, false);
     if (!graph) return null;
     storeGraph(graph);
     adapter.lastApplied = liveMapping;
@@ -571,9 +576,16 @@
       return false;
     }
     if (liveMapping === adapter.lastApplied && adapter.lastRevision === graph.revision) return true;
-    const merged = mergeMappings(graph.liveMapping ?? graph.batchMapping, liveMapping);
+    const merged = mergeMappings(graph.liveMapping ?? graph.batchMapping, liveMapping, graph.authoritative);
     graph.liveMapping = merged;
     graph.mapping = compactMapping(merged);
+    if (!graph.authoritative) {
+      // Read partial native state without writing cached pagination boundaries
+      // back into AppScope. Older-page loading owns these links.
+      adapter.lastApplied = liveMapping;
+      adapter.lastRevision = graph.revision;
+      return true;
+    }
     try {
       context.scope.set(adapter.mappingSignal, context.conversationId, merged);
       adapter.lastApplied = merged;
@@ -914,6 +926,129 @@
     }
   };
 
+  const isHistoryLoaderSource = (source) => source.includes("forceFull") &&
+    source.includes("/conversations/{conversation_id}") &&
+    source.includes("/conversation/{conversation_id}") &&
+    source.includes("include_has_versions");
+
+  const captureFullHistory = (payload, conversationId) => {
+    if (!payload?.mapping || typeof payload.mapping !== "object" ||
+        Array.isArray(payload.mapping) ||
+        String(payload.conversation_id ?? payload.id ?? "") !== conversationId ||
+        Object.hasOwn(payload.mapping, `paginated-root:${conversationId}`)) return;
+    const graph = createGraphState(payload);
+    if (!graph) return;
+    storeGraph(graph);
+    record("full-history-captured", { conversationId });
+    schedule();
+  };
+
+  const wrapHistoryLoader = (original) => {
+    if (historyLoaders.has(original)) return historyLoaders.get(original);
+    const wrapped = function fullHistoryLoader(scope, conversationId, options) {
+      if (!isShell() || options === null || options?.isTemporaryChat === true) {
+        return Reflect.apply(original, this, arguments);
+      }
+      const args = [...arguments];
+      args[2] = { ...options, forceFull: true };
+      if (args[2].initialResponse?.mapping &&
+          Object.hasOwn(args[2].initialResponse.mapping, `paginated-root:${conversationId}`)) {
+        // The native loader returns any mapping-shaped initialResponse before
+        // checking forceFull. Do not let a provisional slice bypass full load.
+        delete args[2].initialResponse;
+      }
+      const result = Reflect.apply(original, this, args);
+      if (diagnostics) diagnostics.fullHistoryLoads++;
+      return result.then((payload) => {
+        try {
+          captureFullHistory(payload, String(conversationId));
+        } catch (error) {
+          warnOnce("full-history-capture", "The full history could not be captured for version arrows.", {
+            error: String(error),
+          });
+        }
+        return payload;
+      });
+    };
+    historyLoaders.set(original, wrapped);
+    return wrapped;
+  };
+
+  const wrapHistoryFactory = (factory) => {
+    if (wrappedHistoryFactories.has(factory)) return factory;
+    const wrapped = function historyFactory(module, exports, require) {
+      const localRequire = function (...args) { return Reflect.apply(require, this, args); };
+      Object.setPrototypeOf(localRequire, require);
+      localRequire.d = function (target, getters, values) {
+        if (target !== exports) return require.d(target, getters, values);
+        const nextGetters = { ...getters };
+        const nextValues = { ...values };
+        for (const [name, getter] of Object.entries(getters ?? {})) {
+          let initialized = false;
+          let previous;
+          let replacement;
+          nextGetters[name] = function historyExport() {
+            // Native exports may be declared before a const/let binding exists.
+            // Read them only when their consumer does, not during registration.
+            const candidate = Reflect.apply(getter, this, arguments);
+            if (initialized && candidate === previous) return replacement;
+            initialized = true;
+            previous = candidate;
+            replacement = candidate;
+            if (typeof candidate === "function" && isHistoryLoaderSource(candidateSource(candidate))) {
+              replacement = wrapHistoryLoader(candidate);
+              record("full-history-loader-installed", { exportName: name });
+            }
+            return replacement;
+          };
+        }
+        for (const [name, candidate] of Object.entries(values ?? {})) {
+          if (typeof candidate === "function" && isHistoryLoaderSource(candidateSource(candidate))) {
+            nextValues[name] = wrapHistoryLoader(candidate);
+          }
+        }
+        return require.d(target, nextGetters, nextValues);
+      };
+      return Reflect.apply(factory, this, [module, exports, localRequire]);
+    };
+    wrappedHistoryFactories.add(wrapped);
+    return wrapped;
+  };
+
+  const installHistoryFactories = (factories, cache) => {
+    if (!factories) return false;
+    const known = typeof factories.O4 === "function" &&
+      isHistoryLoaderSource(candidateSource(factories.O4));
+    const entries = known ? [["O4", factories.O4]] : Object.entries(factories);
+    for (const [moduleId, factory] of entries) {
+      if (typeof factory !== "function" || !isHistoryLoaderSource(candidateSource(factory))) continue;
+      if (cache?.[moduleId]) {
+        warnOnce("full-history-late", "The history loader was already initialized. Reload with the updated extension to enable full history.");
+        return false;
+      }
+      factories[moduleId] = wrapHistoryFactory(factory);
+      record("full-history-factory-installed", { moduleId });
+      return true;
+    }
+    return false;
+  };
+
+  const installFullHistory = (candidate) => {
+    if (!isShell() || typeof candidate?.C !== "function" || typeof candidate.d !== "function") return false;
+    if (installHistoryFactories(candidate.m, candidate.c)) return true;
+    const original = candidate.C;
+    const register = function registerHistory(chunk) {
+      if (installHistoryFactories(chunk?.__webpack_modules__, candidate.c)) {
+        if (candidate.C === register) candidate.C = original;
+        historyRegistration = null;
+      }
+      return Reflect.apply(original, this, arguments);
+    };
+    candidate.C = register;
+    historyRegistration = { candidate, original, register };
+    return true;
+  };
+
   const scanSwitcher = () => {
     if (switcher || !runtime?.c) return switcher;
     if (diagnostics) diagnostics.switcherScans++;
@@ -963,6 +1098,7 @@
   const attachRuntime = (candidate) => {
     if (runtime || !candidate?.c || !candidate?.m) return false;
     runtime = candidate;
+    installFullHistory(candidate);
     if (diagnostics) record("runtime-found", { cacheSize: Object.keys(runtime.c).length });
     scanSwitcher();
     return true;
@@ -1032,6 +1168,7 @@
       for (const controls of document.querySelectorAll(CONTROLS)) controls.remove();
       return;
     }
+    if (!runtime) void discoverRuntime();
     const bubbles = [...document.querySelectorAll(USER_BUBBLE)];
     const contexts = new Map();
     let painted = 0;
@@ -1075,6 +1212,7 @@
     const root = document.documentElement;
     if (!root || observer) return;
     observer = new MutationObserver((mutations) => {
+      if (isShell() && !runtime) void discoverRuntime();
       if (mutations.some(mutationMatters)) schedule();
     });
     observer.observe(root, {
@@ -1083,6 +1221,7 @@
       attributes: true,
       attributeFilter: [SHELL_ATTRIBUTE, "data-user-message-bubble"],
     });
+    if (isShell() && !runtime) void discoverRuntime();
     schedule();
   };
 
@@ -1153,6 +1292,9 @@
     if (frame !== null) cancelAnimationFrame(frame);
     observer?.disconnect();
     rootObserver?.disconnect();
+    if (historyRegistration && historyRegistration.candidate.C === historyRegistration.register) {
+      historyRegistration.candidate.C = historyRegistration.original;
+    }
   }, { once: true });
 
   if (DIAGNOSTICS_ENABLED) {
@@ -1174,6 +1316,8 @@
       graphSummary,
       getGraphSummaryRuns: () => diagnostics.graphSummaries,
       hydrateGraph,
+      installFullHistory,
+      wrapHistoryLoader,
       isBatchResponse,
       mergeMappings,
       mutationMatters,
