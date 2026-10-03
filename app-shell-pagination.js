@@ -17,7 +17,6 @@
     'button[aria-label="Посмотреть версии"]',
     'button[aria-label="Просмотреть версии"]',
   ].join(", ");
-  const BATCH_PATH = "/backend-api/conversations/batch";
   const RUNTIME_HINT = /^\/cdn\/assets\/633146\.[a-z0-9]+\.js$/;
   const MAX_GRAPHS = 3;
   const MAX_EVENTS = 500;
@@ -25,7 +24,6 @@
   const scopeAdapters = new WeakMap();
   const pendingConversations = new Set();
   const conversationErrors = new Map();
-  const observedBatchResponses = new WeakSet();
   const attemptedRuntimeUrls = new Set();
   const warned = new Set();
   const wrappedHistoryFactories = new WeakSet();
@@ -33,8 +31,6 @@
   const diagnostics = DIAGNOSTICS_ENABLED ? {
     version: VERSION,
     installedAt: new Date().toISOString(),
-    batchResponses: 0,
-    batchCaptures: 0,
     renders: 0,
     contextScans: 0,
     scopeScans: 0,
@@ -69,26 +65,11 @@
     if (warned.has(key)) return;
     warned.add(key);
     const build = document.documentElement?.getAttribute("data-build") ?? "unknown";
-    console.warn(`[Edit Pagination][batch] ${message} (build ${build})`, details);
+    console.warn(`[Edit Pagination][AppShell] ${message} (build ${build})`, details);
     record("warning", { key, message, build, ...details });
   };
 
   const isShell = () => document.documentElement?.hasAttribute(SHELL_ATTRIBUTE) === true;
-
-  const responseUrl = (response) => {
-    try {
-      return new URL(String(response?.url ?? ""), location.href);
-    } catch {
-      return null;
-    }
-  };
-
-  const batchResponseUrl = (response) => {
-    const url = responseUrl(response);
-    return url?.origin === location.origin && url.pathname === BATCH_PATH ? url.href : null;
-  };
-
-  const isBatchResponse = (response) => batchResponseUrl(response) !== null;
 
   const cloneNode = (node) => ({
     ...node,
@@ -318,87 +299,6 @@
       const victim = [...graphs.keys()].find((conversationId) => !protectedIds.has(conversationId));
       if (!victim) break;
       graphs.delete(victim);
-    }
-  };
-
-  const captureBatch = (payload, url) => {
-    const conversations = Array.isArray(payload) ? payload : [];
-    const captured = diagnostics ? [] : null;
-    let capturedCount = 0;
-    for (const conversation of conversations) {
-      const graph = createGraphState(conversation);
-      if (!graph) continue;
-      storeGraph(graph);
-      capturedCount++;
-      captured?.push({ conversationId: graph.conversationId, currentNode: graph.currentNode });
-    }
-    if (diagnostics) {
-      diagnostics.batchCaptures++;
-      record("batch-captured", { url, conversationCount: conversations.length, graphs: captured });
-    }
-    if (!capturedCount) warnOnce("batch-shape", "The batch response did not contain a usable conversation graph.");
-    schedule();
-    return capturedCount;
-  };
-
-  const observeBatchPayload = (responseKey, payload, source, url) => {
-    if (observedBatchResponses.has(responseKey)) return;
-    observedBatchResponses.add(responseKey);
-    if (diagnostics) {
-      diagnostics.batchResponses++;
-      record("batch-response", { url, source });
-    }
-    captureBatch(payload, url);
-  };
-
-  const observeBatchError = (url, error) => {
-    warnOnce("batch-json", "The batch response could not be parsed.", {
-      error: String(error),
-      url,
-    });
-  };
-
-  const installBatchObserver = () => {
-    if (typeof Response === "undefined") return;
-    if (typeof Response.prototype.json === "function") {
-      const originalResponseJson = Response.prototype.json;
-      Response.prototype.json = function observedBatchResponseJson(...args) {
-        const url = batchResponseUrl(this);
-        const parsedPromise = Reflect.apply(originalResponseJson, this, args);
-        if (url === null) return parsedPromise;
-        return parsedPromise.then(
-          (payload) => {
-            observeBatchPayload(this, payload, "json", url);
-            return payload;
-          },
-          (error) => {
-            observeBatchError(url, error);
-            throw error;
-          },
-        );
-      };
-    }
-    if (typeof Response.prototype.text === "function") {
-      const originalResponseText = Response.prototype.text;
-      Response.prototype.text = function observedBatchResponseText(...args) {
-        const url = batchResponseUrl(this);
-        const textPromise = Reflect.apply(originalResponseText, this, args);
-        if (url === null) return textPromise;
-        return textPromise.then(
-          (text) => {
-            try {
-              observeBatchPayload(this, JSON.parse(text), "text", url);
-            } catch (error) {
-              observeBatchError(url, error);
-            }
-            return text;
-          },
-          (error) => {
-            observeBatchError(url, error);
-            throw error;
-          },
-        );
-      };
     }
   };
 
@@ -1262,12 +1162,11 @@
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `chatgpt-edit-pagination-batch-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    link.download = `chatgpt-version-arrows-appshell-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
-  installBatchObserver();
   if (document.documentElement) observe();
   else {
     rootObserver = new MutationObserver(() => {
@@ -1309,7 +1208,7 @@
     globalThis.__chatgptBatchPaginationTest = {
       attachRuntime,
       assistantVariants,
-      captureBatch,
+      captureFullHistory,
       createGraphState,
       currentFiber,
       graphFor,
@@ -1318,7 +1217,6 @@
       hydrateGraph,
       installFullHistory,
       wrapHistoryLoader,
-      isBatchResponse,
       mergeMappings,
       mutationMatters,
       readContext,
