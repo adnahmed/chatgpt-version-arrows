@@ -24,6 +24,10 @@
   const scopeAdapters = new WeakMap();
   const controlMessages = new WeakMap();
   const pendingConversations = new Set();
+  const historyLoads = new Map();
+  const activityWatches = new Set();
+  const disabledNativeButtons = new Map();
+  const guardedNativeButtons = new WeakSet();
   const conversationErrors = new Map();
   const attemptedRuntimeUrls = new Set();
   const warned = new Set();
@@ -47,6 +51,8 @@
   } : null;
   let runtime = null;
   let switcher = null;
+  let switcherModuleId = null;
+  let activityAdapter = null;
   let resolveNativeConversationId = null;
   let identityScanSize = -1;
   let runtimeDiscovery = null;
@@ -417,6 +423,97 @@
 
   const ownsGraph = (context, graph) => graph?.conversationId === conversationKey(context);
 
+  const nativeConversationBusy = (scope, conversationId) => {
+    if (!activityAdapter) return true;
+    try {
+      const busy = activityAdapter.read(scope, conversationId);
+      return typeof busy === "boolean" ? busy : true;
+    } catch {
+      return true;
+    }
+  };
+
+  const conversationBusy = (context) => {
+    const id = conversationKey(context);
+    return pendingConversations.has(id) || historyLoads.has(id) ||
+      historyLoads.has(context.conversationId) ||
+      nativeConversationBusy(context.scope, context.conversationId);
+  };
+
+  const watchConversationActivity = (context, currentPass) => {
+    const owner = context.scope.node ?? context.scope;
+    let entry = [...activityWatches].find((item) =>
+      item.owner === owner && item.conversationId === context.conversationId);
+    if (entry) {
+      entry.pass = currentPass;
+      return;
+    }
+    if (!activityAdapter || typeof context.scope.watch !== "function") return;
+    entry = { owner, conversationId: context.conversationId, pass: currentPass, busy: undefined, stop: null };
+    activityWatches.add(entry);
+    try {
+      entry.stop = context.scope.watch((scope) => {
+        const busy = nativeConversationBusy(scope, entry.conversationId);
+        if (busy !== entry.busy) {
+          entry.busy = busy;
+          schedule();
+        }
+      });
+    } catch (error) {
+      activityWatches.delete(entry);
+      warnOnce("activity-watch", "The conversation activity subscription could not be installed.", { error: String(error) });
+    }
+  };
+
+  const releaseActivityWatches = (currentPass) => {
+    for (const entry of activityWatches) {
+      if (entry.pass === currentPass) continue;
+      if (typeof entry.stop === "function") entry.stop();
+      activityWatches.delete(entry);
+    }
+  };
+
+  const restoreNativeButton = (button, originalDisabled) => {
+    const key = getFiber(button);
+    const props = currentFiber(key ? button[key] : null)?.memoizedProps;
+    button.disabled = typeof props?.disabled === "boolean" ? props.disabled : originalDisabled;
+  };
+
+  const blockNativeAssistantButtons = (wrapper, message, busy, currentPass) => {
+    for (const button of wrapper.querySelectorAll("button")) {
+      controlMessages.set(button, message);
+      if (!guardedNativeButtons.has(button)) {
+        button.addEventListener("click", (event) => {
+          const owner = controlMessages.get(button);
+          const context = owner?.isConnected ? readContext(owner) : null;
+          if (context && conversationBusy(context)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+        guardedNativeButtons.add(button);
+      }
+      const saved = disabledNativeButtons.get(button);
+      if (busy) {
+        disabledNativeButtons.set(button, {
+          originalDisabled: saved?.originalDisabled ?? button.disabled, pass: currentPass,
+        });
+        button.disabled = true;
+      } else if (saved) {
+        restoreNativeButton(button, saved.originalDisabled);
+        disabledNativeButtons.delete(button);
+      }
+    }
+  };
+
+  const releaseNativeButtons = (currentPass) => {
+    for (const [button, saved] of disabledNativeButtons) {
+      if (saved.pass === currentPass) continue;
+      restoreNativeButton(button, saved.originalDisabled);
+      disabledNativeButtons.delete(button);
+    }
+  };
+
   const mappingScore = (value, graph, messageId) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return -1;
     if (!value[messageId] && !(graph?.currentNode && value[graph.currentNode])) return -1;
@@ -517,6 +614,9 @@
   const hydrateGraph = (context, graph) => {
     const conversationId = conversationKey(context);
     if (!graph || graph.conversationId !== conversationId) return false;
+    // Loading and native conversation operations own the live graph while busy.
+    // This guard also covers reconciliation, not just arrow click handlers.
+    if (conversationBusy(context)) return false;
     const adapter = discoverScopeAdapter(context, graph);
     if (!adapter) return false;
     let liveMapping;
@@ -542,7 +642,7 @@
       return true;
     }
     try {
-      if (!ownsGraph(context, graph)) return false;
+      if (!ownsGraph(context, graph) || conversationBusy(context)) return false;
       context.scope.set(adapter.mappingSignal, conversationId, merged);
       adapter.lastApplied = merged;
       adapter.lastRevision = graph.revision;
@@ -634,6 +734,7 @@
       return;
     }
     const conversationId = conversationKey(context);
+    if (conversationBusy(context)) return;
     const graph = graphs.get(conversationId);
     if (!ownsGraph(context, graph) || !graph.mapping[currentMessageId] || !graph.mapping[targetMessageId]) return;
     pendingConversations.add(conversationId);
@@ -662,7 +763,7 @@
   const switchVersion = async (bubble, direction) => {
     if (!bubble?.isConnected) return;
     const context = readContext(bubble);
-    if (!context || pendingConversations.has(conversationKey(context))) return;
+    if (!context || conversationBusy(context)) return;
     const graph = graphFor(context);
     if (!graph || !hydrateGraph(context, graph)) return;
     const ids = userVariants(graph, context.messageId);
@@ -672,12 +773,23 @@
     await requestSwitch(context, context.messageId, target, labels().failed);
   };
 
-  const paintUserPagination = (bubble, context, graph, mountInfo, currentPass) => {
+  const retainBusyControls = (controls, message, context, currentPass, busy) => {
+    if (!busy || !controls || controls.dataset.conversationId !== conversationKey(context)) return false;
+    controlMessages.set(controls, message);
+    controls.dataset.messageId = context.messageId;
+    controls.dataset.pass = String(currentPass);
+    controls.setAttribute("aria-busy", "true");
+    for (const button of controls.querySelectorAll("button")) button.disabled = true;
+    return true;
+  };
+
+  const paintUserPagination = (bubble, context, graph, mountInfo, currentPass, busy) => {
     const ids = userVariants(graph, context.messageId);
     const index = ids.indexOf(context.messageId);
     const { mount } = mountInfo;
     let controls = mount.querySelector(CONTROLS);
     if (ids.length < 2 || index < 0) {
+      if (retainBusyControls(controls, bubble, context, currentPass, busy)) return true;
       controls?.remove();
       return false;
     }
@@ -710,7 +822,6 @@
     const [previous, counter, next] = controls.children;
     const caption = `${index + 1}/${ids.length}`;
     if (counter.textContent !== caption) counter.textContent = caption;
-    const busy = pendingConversations.has(graph.conversationId);
     previous.disabled = busy || index === 0;
     next.disabled = busy || index === ids.length - 1;
     controls.setAttribute("aria-busy", String(busy));
@@ -780,7 +891,7 @@
   const switchAssistantVersion = async (message, direction) => {
     if (!message?.isConnected) return;
     const context = readContext(message);
-    if (!context || pendingConversations.has(conversationKey(context))) return;
+    if (!context || conversationBusy(context)) return;
     const graph = graphFor(context);
     if (!graph || !hydrateGraph(context, graph)) return;
     const messageId = context.messageId;
@@ -791,7 +902,7 @@
     await requestSwitch(context, messageId, target, assistantLabels().failed);
   };
 
-  const paintAssistantPagination = (message, context, graph, row, currentPass) => {
+  const paintAssistantPagination = (message, context, graph, row, currentPass, busy) => {
     const messageId = message.getAttribute("data-chatgpt-selection-message-id");
     if (!messageId) return false;
     suppressNativeVersions(row, { role: "assistant", messageId });
@@ -800,6 +911,13 @@
     const native = nativeAssistantPaginationFor(row);
     let controls = row.querySelector(ASSISTANT_CONTROLS);
     if (native) {
+      blockNativeAssistantButtons(native, message, busy, currentPass);
+      if (busy) {
+        // The cached graph may not yet contain the new streaming response.
+        // Do not hide native arrows as "phantom" while its state is changing.
+        controls?.remove();
+        return false;
+      }
       const phantom = ids.length < 2;
       if (phantom && !native.hasAttribute("data-batch-pagination-suppressed")) {
         native.setAttribute("data-batch-pagination-suppressed", "");
@@ -812,6 +930,7 @@
       return false;
     }
     if (ids.length < 2 || index < 0 || !context) {
+      if (retainBusyControls(controls, message, context, currentPass, busy)) return true;
       controls?.remove();
       return false;
     }
@@ -848,7 +967,6 @@
     const [previous, counter, next] = controls.children;
     const caption = `${index + 1}/${ids.length}`;
     if (counter.textContent !== caption) counter.textContent = caption;
-    const busy = pendingConversations.has(graph.conversationId);
     previous.disabled = busy || index === 0;
     next.disabled = busy || index === ids.length - 1;
     controls.setAttribute("aria-busy", String(busy));
@@ -865,12 +983,14 @@
       if (!messageId) continue;
       const context = readContext(message);
       if (!context) continue;
+      watchConversationActivity(context, currentPass);
       const graph = graphFor(context);
-      if (!graph) continue;
-      if (!hydrateGraph(context, graph)) continue;
+      const busy = conversationBusy(context);
+      if (!graph && !busy) continue;
+      if (!busy && !hydrateGraph(context, graph)) continue;
       const row = assistantActionRowFor(message);
       if (!row) continue;
-      if (paintAssistantPagination(message, context, graph, row, currentPass)) painted++;
+      if (paintAssistantPagination(message, context, graph, row, currentPass, busy)) painted++;
     }
     return painted;
   };
@@ -917,7 +1037,18 @@
         // checking forceFull. Do not let a provisional slice bypass full load.
         delete args[2].initialResponse;
       }
-      const result = Reflect.apply(original, this, args);
+      const loadId = conversationKey({ scope, conversationId });
+      historyLoads.set(loadId, (historyLoads.get(loadId) ?? 0) + 1);
+      schedule();
+      const finish = () => {
+        const remaining = (historyLoads.get(loadId) ?? 1) - 1;
+        if (remaining) historyLoads.set(loadId, remaining);
+        else historyLoads.delete(loadId);
+        schedule();
+      };
+      let result;
+      try { result = Reflect.apply(original, this, args); }
+      catch (error) { finish(); throw error; }
       if (diagnostics) diagnostics.fullHistoryLoads++;
       return result.then((payload) => {
         try {
@@ -928,7 +1059,7 @@
           });
         }
         return payload;
-      });
+      }).finally(finish);
     };
     historyLoaders.set(original, wrapped);
     return wrapped;
@@ -1009,8 +1140,39 @@
     return true;
   };
 
+  const scanConversationActivity = () => {
+    if (activityAdapter || !switcher) return;
+    // Follow the signals used by this exact native selector, rather than
+    // guessing busy state from DOM changes or initializing other modules.
+    try {
+      const guard = candidateSource(switcher).replace(/\s+/g, "").match(
+        /if\(\w+\.get\((\w+)\.(\w+),\w+\)\|\|null==\w+\|\|\(0,\1\.(\w+)\)\(\w+\.get\(\1\.(\w+),\w+\)\)/,
+      );
+      const factory = candidateSource(runtime.m?.[switcherModuleId]);
+      const dependency = guard && factory.match(new RegExp(`\\b${guard[1]}=\\w+\\(["']([^"']+)["']\\)`));
+      const state = dependency && runtime.c[dependency[1]]?.exports;
+      if (state && state[guard[2]]?.kind === "readable-family" &&
+          state[guard[4]]?.kind === "readable-family" && typeof state[guard[3]] === "function") {
+        const busySignal = state[guard[2]], statusSignal = state[guard[4]], classify = state[guard[3]];
+        activityAdapter = {
+          read(scope, id) {
+            const switching = scope.get(busySignal, id);
+            const active = classify(scope.get(statusSignal, id));
+            return typeof switching === "boolean" && typeof active === "boolean" ? switching || active : null;
+          },
+        };
+        schedule();
+        return;
+      }
+    } catch {
+      // A lazily registered module may still have uninitialized export bindings.
+    }
+    warnOnce("activity-missing", "The native conversation activity signals could not be identified yet.");
+  };
+
   const scanSwitcher = () => {
-    if (switcher || !runtime?.c) return switcher;
+    if (switcher) { scanConversationActivity(); return switcher; }
+    if (!runtime?.c) return null;
     if (diagnostics) diagnostics.switcherScans++;
     const hits = [];
     const seen = new Set();
@@ -1041,6 +1203,8 @@
     }
     if (hits.length === 1) {
       switcher = hits[0].candidate;
+      switcherModuleId = hits[0].moduleId;
+      scanConversationActivity();
       const switcherDetails = { moduleId: hits[0].moduleId, exportName: hits[0].exportName };
       if (diagnostics) {
         diagnostics.switcher = switcherDetails;
@@ -1127,6 +1291,8 @@
     const currentPass = ++pass;
     if (!isShell()) {
       for (const controls of document.querySelectorAll(CONTROLS)) controls.remove();
+      releaseActivityWatches(currentPass);
+      releaseNativeButtons(currentPass);
       return;
     }
     if (!runtime) void discoverRuntime();
@@ -1138,18 +1304,22 @@
       suppressNativeVersions(mountInfo.row, { role: "user" });
       const context = readContext(bubble);
       if (!context) continue;
+      watchConversationActivity(context, currentPass);
       const graph = graphFor(context);
-      if (!graph) continue;
-      if (!hydrateGraph(context, graph)) continue;
-      if (paintUserPagination(bubble, context, graph, mountInfo, currentPass)) painted++;
+      const busy = conversationBusy(context);
+      if (!graph && !busy) continue;
+      if (!busy && !hydrateGraph(context, graph)) continue;
+      if (paintUserPagination(bubble, context, graph, mountInfo, currentPass, busy)) painted++;
     }
     const assistantPainted = reconcileAssistantPagination(currentPass);
+    releaseActivityWatches(currentPass);
+    releaseNativeButtons(currentPass);
     for (const controls of document.querySelectorAll(CONTROLS)) {
       if (controls.dataset.pass !== String(currentPass)) controls.remove();
     }
     if (diagnostics) record("render", { bubbleCount: bubbles.length, painted, assistantPainted, graphCount: graphs.size });
     if (bubbles.length && graphs.size && !runtime) void discoverRuntime();
-    else if (runtime && !switcher) scanSwitcher();
+    else if (runtime && (!switcher || !activityAdapter)) scanSwitcher();
   };
 
   function schedule() {
@@ -1250,6 +1420,8 @@
     if (frame !== null) cancelAnimationFrame(frame);
     observer?.disconnect();
     rootObserver?.disconnect();
+    releaseActivityWatches(-1);
+    releaseNativeButtons(-1);
     if (historyRegistration && historyRegistration.candidate.C === historyRegistration.register) {
       historyRegistration.candidate.C = historyRegistration.original;
     }
@@ -1269,6 +1441,7 @@
       assistantVariants,
       captureFullHistory,
       conversationKey,
+      conversationBusy,
       createGraphState,
       currentFiber,
       graphFor,
@@ -1282,6 +1455,7 @@
       readContext,
       runtimeUrls,
       scanSwitcher,
+      setActivityAdapter: (adapter) => { activityAdapter = adapter; schedule(); },
       userVariants,
     };
   }
