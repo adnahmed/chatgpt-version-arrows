@@ -51,7 +51,7 @@
   } : null;
   let runtime = null;
   let switcher = null;
-  let switcherModuleId = null;
+  let switcherModuleIds = [];
   let activityAdapter = null;
   let resolveNativeConversationId = null;
   let identityScanSize = -1;
@@ -1145,11 +1145,16 @@
     // Follow the signals used by this exact native selector, rather than
     // guessing busy state from DOM changes or initializing other modules.
     try {
-      const guard = candidateSource(switcher).replace(/\s+/g, "").match(
+      const selectorSource = candidateSource(switcher).replace(/\s+/g, "");
+      const guard = selectorSource.match(
         /if\(\w+\.get\((\w+)\.(\w+),\w+\)\|\|null==\w+\|\|\(0,\1\.(\w+)\)\(\w+\.get\(\1\.(\w+),\w+\)\)/,
       );
-      const factory = candidateSource(runtime.m?.[switcherModuleId]);
-      const dependency = guard && factory.match(new RegExp(`\\b${guard[1]}=\\w+\\(["']([^"']+)["']\\)`));
+      // A barrel can re-export the same selector but its local variable names
+      // belong to a different closure. Resolve dependencies only in the factory
+      // that actually defines this function, not the first export encountered.
+      const factory = switcherModuleIds.map(id => candidateSource(runtime.m?.[id]))
+        .find(source => source.replace(/\s+/g, "").includes(selectorSource));
+      const dependency = guard && factory?.match(new RegExp(`\\b${guard[1]}=\\w+\\(["']([^"']+)["']\\)`));
       const state = dependency && runtime.c[dependency[1]]?.exports;
       if (state && state[guard[2]]?.kind === "readable-family" &&
           state[guard[4]]?.kind === "readable-family" && typeof state[guard[3]] === "function") {
@@ -1175,7 +1180,7 @@
     if (!runtime?.c) return null;
     if (diagnostics) diagnostics.switcherScans++;
     const hits = [];
-    const seen = new Set();
+    const seen = new Map();
     for (const [moduleId, module] of Object.entries(runtime.c)) {
       const exports = module?.exports;
       if (!exports || (typeof exports !== "object" && typeof exports !== "function")) continue;
@@ -1195,15 +1200,17 @@
         if (typeof candidate !== "function") continue;
         const source = candidateSource(candidate);
         if (source.includes("current_node_id") && source.includes("/conversation/{conversation_id}")) {
-          if (seen.has(candidate)) continue;
-          seen.add(candidate);
-          hits.push({ moduleId, exportName, candidate });
+          const existing = seen.get(candidate);
+          if (existing) { existing.moduleIds.add(moduleId); continue; }
+          const hit = { moduleId, exportName, candidate, moduleIds: new Set([moduleId]) };
+          seen.set(candidate, hit);
+          hits.push(hit);
         }
       }
     }
     if (hits.length === 1) {
       switcher = hits[0].candidate;
-      switcherModuleId = hits[0].moduleId;
+      switcherModuleIds = [...hits[0].moduleIds];
       scanConversationActivity();
       const switcherDetails = { moduleId: hits[0].moduleId, exportName: hits[0].exportName };
       if (diagnostics) {
