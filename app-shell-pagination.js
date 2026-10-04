@@ -22,6 +22,7 @@
   const MAX_EVENTS = 500;
   const graphs = new Map();
   const scopeAdapters = new WeakMap();
+  const controlMessages = new WeakMap();
   const pendingConversations = new Set();
   const conversationErrors = new Map();
   const attemptedRuntimeUrls = new Set();
@@ -46,6 +47,8 @@
   } : null;
   let runtime = null;
   let switcher = null;
+  let resolveNativeConversationId = null;
+  let identityScanSize = -1;
   let runtimeDiscovery = null;
   let frame = null;
   let observer = null;
@@ -348,23 +351,71 @@
     return null;
   };
 
-  const readContext = (bubble) => {
+  const readContext = (message) => {
     if (diagnostics) diagnostics.contextScans++;
-    const key = getFiber(bubble);
-    let fiber = currentFiber(key ? bubble[key] : null);
+    const assistantId = message.getAttribute("data-chatgpt-selection-message-id");
+    const itemType = message.matches(USER_BUBBLE) ? "user-message" : "assistant-message";
+    const key = getFiber(message);
+    let fiber = currentFiber(key ? message[key] : null);
     let scope = null;
     let context = null;
     for (let depth = 0; fiber && depth < 100; depth++, fiber = fiber.return) {
       scope ??= scopeInHooks(fiber.memoizedState);
       const props = fiber.memoizedProps;
       if (!context && props && typeof props === "object" &&
-          props.item?.type === "user-message" && typeof props.item.messageId === "string" &&
+          props.item?.type === itemType && typeof props.item.messageId === "string" &&
+          (itemType === "user-message" || props.item.messageId === assistantId) &&
           typeof props.conversationId === "string") {
         context = { conversationId: props.conversationId, messageId: props.item.messageId };
       }
     }
     return scope && context ? { ...context, scope } : null;
   };
+
+  const scanConversationIdentity = () => {
+    if (resolveNativeConversationId || !runtime?.c || !runtime?.m) return;
+    const modules = Object.entries(runtime.c);
+    if (modules.length === identityScanSize) return;
+    identityScanSize = modules.length;
+    // The native mapping resolver follows the local-chatgpt identity family.
+    // Inspect loaded exports only; do not initialize other client modules.
+    const identityModules = Object.entries(runtime.m)
+      .filter(([, factory]) => candidateSource(factory).includes('"local-chatgpt:"'))
+      .map(([id]) => id);
+    const candidates = new Set();
+    for (const [id, module] of modules) {
+      const factorySource = candidateSource(runtime.m[id]);
+      if (!identityModules.some((identityId) => factorySource.includes(`("${identityId}")`))) continue;
+      let names;
+      try { names = Object.keys(module?.exports ?? {}); } catch { continue; }
+      for (const name of names) {
+        let candidate;
+        try { candidate = module.exports[name]; } catch { continue; }
+        if (typeof candidate !== "function" || candidate.length !== 2) continue;
+        const source = candidateSource(candidate).replace(/\s+/g, "");
+        if (/^function[^(]*\([^)]*\)\{returnnull==[^{}]+\?\?[^{}]+\}$/.test(source)) candidates.add(candidate);
+      }
+    }
+    if (candidates.size === 1) resolveNativeConversationId = [...candidates][0];
+  };
+
+  const conversationKey = (context) => {
+    const id = context?.conversationId;
+    if (typeof id !== "string" || !id) return null;
+    if (!id.startsWith("local-chatgpt:") || !context.scope) return id;
+    if (!resolveNativeConversationId) scanConversationIdentity();
+    if (resolveNativeConversationId) {
+      try {
+        const resolved = resolveNativeConversationId((atom, key) => context.scope.get(atom, key), id);
+        if (typeof resolved === "string" && resolved) return resolved;
+      } catch {
+        // An unregistered local conversation retains its own isolated key.
+      }
+    }
+    return id;
+  };
+
+  const ownsGraph = (context, graph) => graph?.conversationId === conversationKey(context);
 
   const mappingScore = (value, graph, messageId) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return -1;
@@ -388,14 +439,15 @@
   };
 
   const discoverScopeAdapter = (context, graph) => {
+    const conversationId = conversationKey(context);
     const cache = adapterCacheFor(context.scope);
-    const cached = cache.get(context.conversationId);
+    const cached = cache.get(conversationId);
     if (cached) {
       try {
-        context.scope.get(cached.mappingSignal, context.conversationId);
+        context.scope.get(cached.mappingSignal, conversationId);
         return cached;
       } catch {
-        cache.delete(context.conversationId);
+        cache.delete(conversationId);
       }
     }
     if (diagnostics) diagnostics.scopeScans++;
@@ -406,7 +458,7 @@
       if (atom?.kind !== "signal-family") continue;
       let value;
       try {
-        value = context.scope.get(atom, context.conversationId);
+        value = context.scope.get(atom, conversationId);
       } catch {
         continue;
       }
@@ -416,7 +468,7 @@
     }
     if (!best) return null;
     const adapter = { mappingSignal: best.mappingSignal, lastApplied: null, lastRevision: 0 };
-    cache.set(context.conversationId, adapter);
+    cache.set(conversationId, adapter);
     if (diagnostics) {
       record("scope-adapter-found", {
         conversationId: context.conversationId,
@@ -427,16 +479,17 @@
   };
 
   const restoreGraphFromScope = (context) => {
+    const conversationId = conversationKey(context);
     const adapter = discoverScopeAdapter(context, null);
     if (!adapter) return null;
     let liveMapping;
     try {
-      liveMapping = context.scope.get(adapter.mappingSignal, context.conversationId);
+      liveMapping = context.scope.get(adapter.mappingSignal, conversationId);
     } catch {
       return null;
     }
     const graph = createGraphState({
-      id: context.conversationId,
+      id: conversationId,
       current_node: context.messageId,
       mapping: liveMapping,
     }, false);
@@ -454,20 +507,21 @@
   };
 
   const graphFor = (context) => {
-    const graph = graphs.get(context.conversationId) ??
-      [...graphs.values()].find((candidate) => candidate.mapping[context.messageId]);
-    if (!graph) return restoreGraphFromScope(context);
+    const graph = graphs.get(conversationKey(context));
+    if (!graph) return context.scope ? restoreGraphFromScope(context) : null;
     graphs.delete(graph.conversationId);
     graphs.set(graph.conversationId, graph);
     return graph;
   };
 
   const hydrateGraph = (context, graph) => {
+    const conversationId = conversationKey(context);
+    if (!graph || graph.conversationId !== conversationId) return false;
     const adapter = discoverScopeAdapter(context, graph);
     if (!adapter) return false;
     let liveMapping;
     try {
-      liveMapping = context.scope.get(adapter.mappingSignal, context.conversationId);
+      liveMapping = context.scope.get(adapter.mappingSignal, conversationId);
     } catch (error) {
       if (diagnostics) {
         diagnostics.scopeHydrationFailures++;
@@ -475,6 +529,7 @@
       }
       return false;
     }
+    if (conversationKey(context) !== conversationId) return false;
     if (liveMapping === adapter.lastApplied && adapter.lastRevision === graph.revision) return true;
     const merged = mergeMappings(graph.liveMapping ?? graph.batchMapping, liveMapping, graph.authoritative);
     graph.liveMapping = merged;
@@ -487,7 +542,8 @@
       return true;
     }
     try {
-      context.scope.set(adapter.mappingSignal, context.conversationId, merged);
+      if (!ownsGraph(context, graph)) return false;
+      context.scope.set(adapter.mappingSignal, conversationId, merged);
       adapter.lastApplied = merged;
       adapter.lastRevision = graph.revision;
       if (diagnostics) {
@@ -577,8 +633,11 @@
       warnOnce("switcher-missing", "The native branch switcher is not available.");
       return;
     }
-    pendingConversations.add(context.conversationId);
-    conversationErrors.delete(context.conversationId);
+    const conversationId = conversationKey(context);
+    const graph = graphs.get(conversationId);
+    if (!ownsGraph(context, graph) || !graph.mapping[currentMessageId] || !graph.mapping[targetMessageId]) return;
+    pendingConversations.add(conversationId);
+    conversationErrors.delete(conversationId);
     if (diagnostics) {
       record("switch-requested", {
         conversationId: context.conversationId,
@@ -591,18 +650,19 @@
       await switcher(context.scope, context.conversationId, targetMessageId);
       if (diagnostics) record("switch-completed", { conversationId: context.conversationId, targetMessageId });
     } catch (error) {
-      conversationErrors.set(context.conversationId, failureMessage);
+      conversationErrors.set(conversationId, failureMessage);
       if (diagnostics) record("switch-failed", { conversationId: context.conversationId, targetMessageId, error: String(error) });
       warnOnce("switch-failed", failureMessage, { error: String(error) });
     } finally {
-      pendingConversations.delete(context.conversationId);
+      pendingConversations.delete(conversationId);
       schedule();
     }
   };
 
   const switchVersion = async (bubble, direction) => {
+    if (!bubble?.isConnected) return;
     const context = readContext(bubble);
-    if (!context || pendingConversations.has(context.conversationId)) return;
+    if (!context || pendingConversations.has(conversationKey(context))) return;
     const graph = graphFor(context);
     if (!graph || !hydrateGraph(context, graph)) return;
     const ids = userVariants(graph, context.messageId);
@@ -630,7 +690,7 @@
       const previous = createButton(text.previous, -1, (event) => {
         event.preventDefault();
         event.stopPropagation();
-        void switchVersion(bubble, -1);
+        void switchVersion(controlMessages.get(controls), -1);
       });
       const counter = document.createElement("span");
       counter.setAttribute("aria-live", "polite");
@@ -638,22 +698,23 @@
       const next = createButton(text.next, 1, (event) => {
         event.preventDefault();
         event.stopPropagation();
-        void switchVersion(bubble, 1);
+        void switchVersion(controlMessages.get(controls), 1);
       });
       controls.append(previous, counter, next);
     }
+    controlMessages.set(controls, bubble);
     controls.dataset.pass = String(currentPass);
-    controls.dataset.conversationId = context.conversationId;
+    controls.dataset.conversationId = graph.conversationId;
     controls.dataset.messageId = context.messageId;
     if (controls.parentElement !== mount) mount.append(controls);
     const [previous, counter, next] = controls.children;
     const caption = `${index + 1}/${ids.length}`;
     if (counter.textContent !== caption) counter.textContent = caption;
-    const busy = pendingConversations.has(context.conversationId);
+    const busy = pendingConversations.has(graph.conversationId);
     previous.disabled = busy || index === 0;
     next.disabled = busy || index === ids.length - 1;
     controls.setAttribute("aria-busy", String(busy));
-    const error = conversationErrors.get(context.conversationId) ?? "";
+    const error = conversationErrors.get(graph.conversationId) ?? "";
     controls.title = error;
     counter.setAttribute("aria-label", error ? `${caption}. ${error}` : caption);
     return true;
@@ -716,19 +777,13 @@
     };
   };
 
-  const contextForConversation = (conversationId) => {
-    for (const bubble of document.querySelectorAll(USER_BUBBLE)) {
-      const context = readContext(bubble);
-      if (context?.conversationId === conversationId) return context;
-    }
-    return null;
-  };
-
-  const switchAssistantVersion = async (messageId, direction) => {
-    const graph = [...graphs.values()].find((candidate) => candidate.mapping[messageId]);
-    if (!graph) return;
-    const context = contextForConversation(graph.conversationId);
-    if (!context || pendingConversations.has(context.conversationId) || !hydrateGraph(context, graph)) return;
+  const switchAssistantVersion = async (message, direction) => {
+    if (!message?.isConnected) return;
+    const context = readContext(message);
+    if (!context || pendingConversations.has(conversationKey(context))) return;
+    const graph = graphFor(context);
+    if (!graph || !hydrateGraph(context, graph)) return;
+    const messageId = context.messageId;
     const ids = assistantVariants(graph, messageId);
     const index = ids.indexOf(messageId);
     const target = index < 0 ? null : ids[index + direction];
@@ -770,7 +825,7 @@
       const previous = createButton(text.previous, -1, (event) => {
         event.preventDefault();
         event.stopPropagation();
-        void switchAssistantVersion(controls.dataset.messageId, -1);
+        void switchAssistantVersion(controlMessages.get(controls), -1);
       });
       const counter = document.createElement("span");
       counter.setAttribute("aria-live", "polite");
@@ -778,12 +833,13 @@
       const next = createButton(text.next, 1, (event) => {
         event.preventDefault();
         event.stopPropagation();
-        void switchAssistantVersion(controls.dataset.messageId, 1);
+        void switchAssistantVersion(controlMessages.get(controls), 1);
       });
       controls.append(previous, counter, next);
     }
+    controlMessages.set(controls, message);
     controls.dataset.pass = String(currentPass);
-    controls.dataset.conversationId = context.conversationId;
+    controls.dataset.conversationId = graph.conversationId;
     controls.dataset.messageId = messageId;
     const { mount, insertionPoint } = assistantPaginationMount(row);
     if (controls.parentElement !== mount || (insertionPoint && controls.nextElementSibling !== insertionPoint)) {
@@ -792,25 +848,26 @@
     const [previous, counter, next] = controls.children;
     const caption = `${index + 1}/${ids.length}`;
     if (counter.textContent !== caption) counter.textContent = caption;
-    const busy = pendingConversations.has(context.conversationId);
+    const busy = pendingConversations.has(graph.conversationId);
     previous.disabled = busy || index === 0;
     next.disabled = busy || index === ids.length - 1;
     controls.setAttribute("aria-busy", String(busy));
-    const error = conversationErrors.get(context.conversationId) ?? "";
+    const error = conversationErrors.get(graph.conversationId) ?? "";
     controls.title = error;
     counter.setAttribute("aria-label", error ? `${caption}. ${error}` : caption);
     return true;
   };
 
-  const reconcileAssistantPagination = (currentPass, contexts) => {
+  const reconcileAssistantPagination = (currentPass) => {
     let painted = 0;
     for (const message of document.querySelectorAll(ASSISTANT_MESSAGE)) {
       const messageId = message.getAttribute("data-chatgpt-selection-message-id");
       if (!messageId) continue;
-      const graph = [...graphs.values()].find((candidate) => candidate.mapping[messageId]);
+      const context = readContext(message);
+      if (!context) continue;
+      const graph = graphFor(context);
       if (!graph) continue;
-      const context = contexts.get(graph.conversationId) ?? null;
-      if (context && !hydrateGraph(context, graph)) continue;
+      if (!hydrateGraph(context, graph)) continue;
       const row = assistantActionRowFor(message);
       if (!row) continue;
       if (paintAssistantPagination(message, context, graph, row, currentPass)) painted++;
@@ -831,11 +888,13 @@
     source.includes("/conversation/{conversation_id}") &&
     source.includes("include_has_versions");
 
-  const captureFullHistory = (payload, conversationId) => {
+  const captureFullHistory = (payload, conversationId, scope) => {
+    const expectedId = conversationKey({ conversationId, scope });
     if (!payload?.mapping || typeof payload.mapping !== "object" ||
         Array.isArray(payload.mapping) ||
-        String(payload.conversation_id ?? payload.id ?? "") !== conversationId ||
-        Object.hasOwn(payload.mapping, `paginated-root:${conversationId}`)) return;
+        String(payload.conversation_id ?? payload.id ?? "") !== expectedId ||
+        (Object.hasOwn(payload.mapping, `paginated-root:${expectedId}`) ||
+         Object.hasOwn(payload.mapping, `paginated-root:${conversationId}`))) return;
     const graph = createGraphState(payload);
     if (!graph) return;
     storeGraph(graph);
@@ -852,7 +911,8 @@
       const args = [...arguments];
       args[2] = { ...options, forceFull: true };
       if (args[2].initialResponse?.mapping &&
-          Object.hasOwn(args[2].initialResponse.mapping, `paginated-root:${conversationId}`)) {
+          (Object.hasOwn(args[2].initialResponse.mapping, `paginated-root:${conversationId}`) ||
+           Object.hasOwn(args[2].initialResponse.mapping, `paginated-root:${conversationKey({ scope, conversationId })}`))) {
         // The native loader returns any mapping-shaped initialResponse before
         // checking forceFull. Do not let a provisional slice bypass full load.
         delete args[2].initialResponse;
@@ -861,7 +921,7 @@
       if (diagnostics) diagnostics.fullHistoryLoads++;
       return result.then((payload) => {
         try {
-          captureFullHistory(payload, String(conversationId));
+          captureFullHistory(payload, String(conversationId), scope);
         } catch (error) {
           warnOnce("full-history-capture", "The full history could not be captured for version arrows.", {
             error: String(error),
@@ -998,6 +1058,7 @@
   const attachRuntime = (candidate) => {
     if (runtime || !candidate?.c || !candidate?.m) return false;
     runtime = candidate;
+    scanConversationIdentity();
     installFullHistory(candidate);
     if (diagnostics) record("runtime-found", { cacheSize: Object.keys(runtime.c).length });
     scanSwitcher();
@@ -1070,7 +1131,6 @@
     }
     if (!runtime) void discoverRuntime();
     const bubbles = [...document.querySelectorAll(USER_BUBBLE)];
-    const contexts = new Map();
     let painted = 0;
     for (const bubble of bubbles) {
       const mountInfo = findMount(bubble);
@@ -1078,13 +1138,12 @@
       suppressNativeVersions(mountInfo.row, { role: "user" });
       const context = readContext(bubble);
       if (!context) continue;
-      contexts.set(context.conversationId, context);
       const graph = graphFor(context);
       if (!graph) continue;
       if (!hydrateGraph(context, graph)) continue;
       if (paintUserPagination(bubble, context, graph, mountInfo, currentPass)) painted++;
     }
-    const assistantPainted = reconcileAssistantPagination(currentPass, contexts);
+    const assistantPainted = reconcileAssistantPagination(currentPass);
     for (const controls of document.querySelectorAll(CONTROLS)) {
       if (controls.dataset.pass !== String(currentPass)) controls.remove();
     }
@@ -1209,6 +1268,7 @@
       attachRuntime,
       assistantVariants,
       captureFullHistory,
+      conversationKey,
       createGraphState,
       currentFiber,
       graphFor,
