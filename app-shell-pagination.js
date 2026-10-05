@@ -474,9 +474,13 @@
   };
 
   const restoreNativeButton = (button, originalDisabled) => {
-    const key = getFiber(button);
-    const props = currentFiber(key ? button[key] : null)?.memoizedProps;
-    button.disabled = typeof props?.disabled === "boolean" ? props.disabled : originalDisabled;
+    // React commits host props here; Fiber/alternate props can still describe
+    // the busy render. Restore the native value, including an omitted false.
+    const propsKey = Object.getOwnPropertyNames(button)
+      .find((name) => name.startsWith("__reactProps$"));
+    const key = propsKey ? null : getFiber(button);
+    const props = propsKey ? button[propsKey] : currentFiber(key ? button[key] : null)?.memoizedProps;
+    button.disabled = props && typeof props === "object" ? Boolean(props.disabled) : originalDisabled;
   };
 
   const blockNativeAssistantButtons = (wrapper, message, busy, currentPass) => {
