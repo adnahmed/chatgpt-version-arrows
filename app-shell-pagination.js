@@ -483,6 +483,12 @@
     button.disabled = props && typeof props === "object" ? Boolean(props.disabled) : originalDisabled;
   };
 
+  const releaseNativeButton = (button, saved) => {
+    saved.observer.disconnect();
+    disabledNativeButtons.delete(button);
+    restoreNativeButton(button, saved.originalDisabled);
+  };
+
   const blockNativeAssistantButtons = (wrapper, message, busy, currentPass) => {
     for (const button of wrapper.querySelectorAll("button")) {
       controlMessages.set(button, message);
@@ -497,15 +503,26 @@
         }, true);
         guardedNativeButtons.add(button);
       }
-      const saved = disabledNativeButtons.get(button);
+      let saved = disabledNativeButtons.get(button);
       if (busy) {
-        disabledNativeButtons.set(button, {
-          originalDisabled: saved?.originalDisabled ?? button.disabled, pass: currentPass,
-        });
-        button.disabled = true;
+        if (!saved) {
+          // A native React commit can change disabled while our operation is
+          // still pending. Observe only this arrow, only while we hold it.
+          const disabledObserver = new MutationObserver(() => {
+            if (stopped || button.disabled || !disabledNativeButtons.has(button)) return;
+            const owner = controlMessages.get(button);
+            const context = button.isConnected && owner?.isConnected ? readContext(owner) : null;
+            if (context && conversationBusy(context)) button.disabled = true;
+            else schedule();
+          });
+          saved = { originalDisabled: button.disabled, pass: currentPass, observer: disabledObserver };
+          disabledNativeButtons.set(button, saved);
+          disabledObserver.observe(button, { attributes: true, attributeFilter: ["disabled"] });
+        }
+        saved.pass = currentPass;
+        if (!button.disabled) button.disabled = true;
       } else if (saved) {
-        restoreNativeButton(button, saved.originalDisabled);
-        disabledNativeButtons.delete(button);
+        releaseNativeButton(button, saved);
       }
     }
   };
@@ -513,8 +530,7 @@
   const releaseNativeButtons = (currentPass) => {
     for (const [button, saved] of disabledNativeButtons) {
       if (saved.pass === currentPass) continue;
-      restoreNativeButton(button, saved.originalDisabled);
-      disabledNativeButtons.delete(button);
+      releaseNativeButton(button, saved);
     }
   };
 
