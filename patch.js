@@ -14,40 +14,8 @@
   const INTERESTING_URL = /statsig|initialize|bootstrap/i;
   const INTERESTING_CONTENT_TYPE = /json|javascript|text|html/i;
   const MAX_JSON_STRING_DEPTH = 2;
-  let originalParse = JSON.parse;
-
-  const hasEditPaginationTextShape = (text) =>
-    text.includes("hide_pagination") &&
-    text.includes("edit_buttons_hidden") &&
-    text.includes("edit_actions_treatment") &&
-    text.includes("edit_warning");
-
-  const patchTextFallback = (text) => {
-    if (typeof text !== "string" || !TEXT_NEEDLE.test(text)) return text;
-    if (!hasEditPaginationTextShape(text)) return text;
-
-    return text
-      .replace(/("hide_pagination"\s*:\s*)true/g, "$1false")
-      .replace(/(\\"hide_pagination\\"\s*:\s*)true/g, "$1false")
-      .replace(/("edit_buttons_hidden"\s*:\s*)true/g, "$1false")
-      .replace(/(\\"edit_buttons_hidden\\"\s*:\s*)true/g, "$1false")
-      .replace(/("edit_actions_treatment"\s*:\s*)"(warning|branch_prefill)"/g, '$1"default"')
-      .replace(/(\\"edit_actions_treatment\\"\s*:\s*)\\"(warning|branch_prefill)\\"/g, '$1\\"default\\"')
-      .replace(/("edit_warning"\s*:\s*)"warning"/g, '$1"none"')
-      .replace(/(\\"edit_warning\\"\s*:\s*)\\"warning\\"/g, '$1\\"none\\"')
-      .replace(/("variant_modal"\s*:\s*)true/g, "$1false")
-      .replace(/(\\"variant_modal\\"\s*:\s*)true/g, "$1false")
-      .replace(/("group_name"\s*:\s*)"(Warning|Branch Prefill)"/g, '$1"Control"')
-      .replace(/(\\"group_name\\"\s*:\s*)\\"(Warning|Branch Prefill)\\"/g, '$1\\"Control\\"')
-      .replace(
-        /("is_user_in_experiment"\s*:\s*)true(?=,\s*"allocated_experiment_name"\s*:\s*"(3879630193|3879348497|1973873291)")/g,
-        "$1false",
-      )
-      .replace(
-        /(\\"is_user_in_experiment\\"\s*:\s*)true(?=,\s*\\"allocated_experiment_name\\"\s*:\s*\\"(3879630193|3879348497|1973873291)\\")/g,
-        "$1false",
-      );
-  };
+  const originalParse = JSON.parse;
+  const isRecord = (value) => value && typeof value === "object" && !Array.isArray(value);
 
   const hasEditPaginationShape = (value) =>
     value &&
@@ -99,12 +67,19 @@
 
     if (!hit) return false;
 
+    const explicitParameters = Array.isArray(cfg.explicit_parameters)
+      ? cfg.explicit_parameters.filter((name) => !EDIT_PARAMETER_NAMES.has(name))
+      : [];
+    const changed = !isDefaultEditPaginationValue(value) ||
+      cfg.group_name !== "Control" || cfg.is_user_in_experiment !== false ||
+      !Array.isArray(cfg.explicit_parameters) ||
+      explicitParameters.length !== cfg.explicit_parameters.length;
+    if (!changed) return false;
+
     normalizeEditPaginationValue(value);
     cfg.group_name = "Control";
     cfg.is_user_in_experiment = false;
-    cfg.explicit_parameters = Array.isArray(cfg.explicit_parameters)
-      ? cfg.explicit_parameters.filter((name) => !EDIT_PARAMETER_NAMES.has(name))
-      : [];
+    cfg.explicit_parameters = explicitParameters;
 
     return true;
   };
@@ -130,48 +105,50 @@
     return true;
   };
 
-  const patchPossiblyJsonText = (text, jsonStringDepth = 0) => {
-    if (typeof text !== "string" || !TEXT_NEEDLE.test(text)) return text;
+  const patchPossiblyJsonText = (text, jsonStringDepth = 0, seen = new WeakSet()) => {
+    if (typeof text !== "string" || !TEXT_NEEDLE.test(text) ||
+        jsonStringDepth > MAX_JSON_STRING_DEPTH) return text;
+    try {
+      const parsed = originalParse.call(JSON, text);
+      if (patchConfigObject(parsed, jsonStringDepth, seen)) return JSON.stringify(parsed);
+    } catch {
+      // Never apply text replacements to prose, HTML or malformed JSON.
+    }
+    return text;
+  };
 
-    if (jsonStringDepth <= MAX_JSON_STRING_DEPTH) {
-      try {
-        const parsed = originalParse.call(JSON, text);
-        if (parsed && typeof parsed === "object") return JSON.stringify(patchObject(parsed, jsonStringDepth));
-      } catch {
-        // Not a standalone JSON value. Fall back to constrained text replacement.
+  const patchConfigObject = (root, jsonStringDepth, seen) => {
+    if (!isRecord(root) || seen.has(root)) return false;
+    seen.add(root);
+    let changed = false;
+
+    // These are Statsig configuration containers, not arbitrary application
+    // fields. Do not descend into messages, config metadata or config values.
+    for (const category of ["layer_configs", "dynamic_configs"]) {
+      if (!Object.hasOwn(root, category) || !isRecord(root[category])) continue;
+      const configs = root[category];
+      if (category === "layer_configs" && Object.hasOwn(configs, PAGINATED_MESSAGES_LAYER_ID)) {
+        changed = patchPaginatedMessagesConfig(configs[PAGINATED_MESSAGES_LAYER_ID]) || changed;
       }
+      for (const cfg of Object.values(configs)) changed = patchExperimentConfig(cfg) || changed;
     }
 
-    return patchTextFallback(text);
+    // Saved classic bootstraps contain a serialized Statsig payload. Only this
+    // named envelope may contain another configuration object/JSON string.
+    if (Object.hasOwn(root, "statsigPayload")) {
+      const payload = root.statsigPayload;
+      if (typeof payload === "string") {
+        const patched = patchPossiblyJsonText(payload, jsonStringDepth + 1, seen);
+        if (patched !== payload) { root.statsigPayload = patched; changed = true; }
+      } else {
+        changed = patchConfigObject(payload, jsonStringDepth, seen) || changed;
+      }
+    }
+    return changed;
   };
 
   const patchObject = (root, jsonStringDepth = 0) => {
-    const seen = new WeakSet();
-
-    const walk = (obj) => {
-      if (!obj || typeof obj !== "object" || seen.has(obj)) return;
-      seen.add(obj);
-
-      if (obj.layer_configs && typeof obj.layer_configs === "object") {
-        patchPaginatedMessagesConfig(obj.layer_configs[PAGINATED_MESSAGES_LAYER_ID]);
-        for (const cfg of Object.values(obj.layer_configs)) patchExperimentConfig(cfg);
-      }
-
-      patchExperimentConfig(obj);
-
-      if (hasEditPaginationShape(obj)) normalizeEditPaginationValue(obj);
-
-      for (const key of Object.keys(obj)) {
-        const value = obj[key];
-        if (typeof value === "string") {
-          obj[key] = patchPossiblyJsonText(value, jsonStringDepth + 1);
-        } else {
-          walk(value);
-        }
-      }
-    };
-
-    walk(root);
+    patchConfigObject(root, jsonStringDepth, new WeakSet());
     return root;
   };
 

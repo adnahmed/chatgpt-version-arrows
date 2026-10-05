@@ -23,13 +23,17 @@ Restores the previous/next version arrows for edited messages and regenerated re
 9. Click **Load unpacked**.
 10. Select the extracted folder that directly contains `manifest.json`. Do not select the ZIP file, the `assets` folder, or a parent folder.
 11. Make sure the extension appears on the Extensions page and is enabled.
-12. Reload every open ChatGPT tab with `Ctrl+Shift+R`.
+12. Reload every open ChatGPT tab with `F5`.
 
 > Keep the extracted folder after installation. Chrome loads the extension directly from that location. If you delete, rename, or move the folder, the extension may stop working and will need to be loaded again.
 
 If Chrome reports that the manifest is missing or unreadable, you selected the wrong folder. Select the folder that directly contains `manifest.json`.
 
-## What's New in 0.6.0
+## What's New in 0.6.2
+
+Updated for AppShell's changed conversation loading. The extension now uses ChatGPT's native full-history loader to retrieve all message versions and restore their previous/next arrows, instead of relying on the former batch response.
+
+### 0.6.0 — AppShell support
 
 ChatGPT is rolling out a new client framework called **AppShell** alongside the classic web client. AppShell is the shared application shell around conversations, navigation, tabs, and panels. It uses a different conversation-loading and state model, so the classic config patch alone cannot restore the previous/next version arrows there.
 
@@ -40,15 +44,19 @@ This version adds AppShell support while preserving the existing classic-client 
 
 ## What It Changes
 
-### AppShell client
-
-AppShell loads conversation graphs through:
+Both client integrations use the same full-history endpoint:
 
 ```txt
-POST /backend-api/conversations/batch
+GET /backend-api/conversation/<conversation_id>
 ```
 
-The response already contains the branch graph needed to identify edited user messages and regenerated assistant responses. The AppShell adapter combines that graph with ChatGPT's live AppScope state, adds compact previous/next controls to the existing action rows, and uses ChatGPT's native branch switcher to change the active version.
+The response contains the full message `mapping` with `parent`/`children` links, plus `current_node` identifying the selected message. These relationships are used to identify message versions and navigate branches.
+
+### AppShell client
+
+In the current AppShell client, the extension enables the native `forceFull` option in ChatGPT's conversation loader.
+
+The AppShell adapter combines the full graph with ChatGPT's live AppScope state, adds compact previous/next controls to the existing action rows, and uses ChatGPT's native branch switcher to change the active version.
 
 When AppShell already renders valid native response arrows, the extension leaves them in place. It supplies matching arrows when the native controls are missing and removes false version controls when the visible graph contains only one real response.
 
@@ -93,15 +101,7 @@ Message versions can be requested separately through:
 /backend-api/conversations/<conversation_id>/versions?message_id=<message_id>
 ```
 
-The original classic path uses:
-
-```txt
-/backend-api/conversation/<conversation_id>
-```
-
-This endpoint returns the full conversation `mapping`, including the `parent`, `children`, and `current_node` relationships used by the original branch controls.
-
-The extension changes `num_turns` to `0` before ChatGPT reads the config. In the affected classic frontend, `0` selects the original loading and branch-navigation path.
+The extension changes `num_turns` to `0` before ChatGPT reads the config. In the affected classic frontend, `0` selects the full-history endpoint described above and restores the original loading and branch-navigation path.
 
 If `num_turns` appears in `explicit_parameters`, only that entry is removed. Other parameters and rollout metadata are preserved.
 
@@ -193,7 +193,11 @@ After the matching config is normalized, the classic frontend renders and operat
 
 ### AppShell adapter
 
-`app-shell-pagination.js` is loaded on every matching ChatGPT page, but it renders and switches version controls only after detecting the AppShell client. It captures the exact `/backend-api/conversations/batch` response, combines that graph with the corresponding live AppScope state, and reconciles the controls with the current message action rows.
+`app-shell-pagination.js` is loaded on every matching ChatGPT page, but it renders and switches version controls only after detecting the AppShell client. It wraps the native conversation loader early enough to set `forceFull: true`, captures the resulting full graph, combines it with the corresponding live AppScope state, and reconciles the controls with the current message action rows.
+
+Partial graphs recovered from AppScope are read without writing their cached page-boundary links back into ChatGPT's state. Only a full graph is used to restore missing version branches.
+
+The AppShell adapter uses only the native full-history loader as its source of full graphs. The former batch-response handler has been removed, so a batch response cannot replace the graph captured through `forceFull`.
 
 The adapter uses ChatGPT's native branch-switching function.
 
@@ -201,7 +205,8 @@ The adapter uses ChatGPT's native branch-switching function.
 
 ### AppShell client
 
-- AppShell is under active development, and its internal conversation state, action-row structure, and branch-switching contracts are not stable. A ChatGPT frontend update may require a corresponding extension update.
+- AppShell is under active development, and its internal full-history loader, conversation state, action-row structure, and branch-switching contracts are not stable. A ChatGPT frontend update may require a corresponding extension update.
+- In very long conversations, version arrows may take time to appear while the full graph loads.
 
 ### Classic client
 
