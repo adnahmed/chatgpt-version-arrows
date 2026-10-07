@@ -1045,7 +1045,7 @@
   const wrapHistoryLoader = (original) => {
     if (historyLoaders.has(original)) return historyLoaders.get(original);
     const wrapped = function fullHistoryLoader(scope, conversationId, options) {
-      if (!isShell() || options === null || options?.isTemporaryChat === true) {
+      if (!isShell() || options === null) {
         return Reflect.apply(original, this, arguments);
       }
       const args = [...arguments];
